@@ -348,3 +348,125 @@ purge. Verified clean locally under clang 19 with
 Covered under F-15's DeadStores fix: `ViolationKindName()` keeps a
 trailing `"unknown"` return so violation kinds added later degrade to a
 readable message instead of undefined behavior.
+
+## Round 3 (CI rectification)
+
+## F-19 (High, delivery integrity) — round-2 push was missing three files; four jobs built a target that did not exist
+
+The round-2 source zip was complete (verified post-hoc against the zip
+itself: its `CMakeLists.txt` contains the harness target, its `.clang-tidy`
+contains the `bugprone-easily-swappable-parameters` disable). The
+subsequent push to GitHub, commit 02b6c9a "minor changes", carried the new
+and modified test sources, the src changes, the tools scripts and the
+round-2 `ci.yml` — but left `CMakeLists.txt`, `.clang-tidy` and
+`CHECKLIST.md` at their round-1 versions, and reset `tools/*.sh` from
+executable to plain files. Consequences, all observed in the CI run:
+
+- coverage, windows-msvc-asan (and by construction windows-va-emulation
+  and msan) build `fast_alloc_msan_harness`, which only the round-2
+  `CMakeLists.txt` defines → "No rule to make target" / MSB1009.
+- coverage would have reported 0.0% again: the round-1 instrumentation
+  block sits below every target (see F-11).
+- static-analysis failed on six `bugprone-easily-swappable-parameters`
+  error-severity findings (global_heap.cpp x5, slab.cpp x1) that the
+  round-2 `.clang-tidy` disables with rationale.
+
+Fix: this round redelivers the complete tree together with a `SHA256SUMS`
+manifest and a three-line post-apply check (CHECKLIST.md, round 3 section)
+that fails immediately when `CMakeLists.txt` or `.clang-tidy` are stale or
+a tools script lost its executable bit — turning "four red jobs after a
+push" into a pre-push shell error.
+
+## F-20 (High, build) — ignored `freopen()` return is a hard error on Ubuntu gcc
+
+`tests/test_audit_scan.cpp` (round-2 portable rewrite) called
+`std::freopen(path, "w", stderr)` and discarded the result. glibc declares
+`freopen` with `__wur`; Ubuntu's gcc enables `_FORTIFY_SOURCE=3` by default
+at optimization levels, which exposes that attribute, and the project's
+`-Werror` made every Linux job that compiles the file fail with
+`[-Werror=unused-result]`. Reproduced word-for-word locally with
+`g++ -O2 -D_FORTIFY_SOURCE=3 -Werror` (Debian's toolchain does not warn —
+which is exactly why the round-2 local matrix did not catch it).
+
+Beyond the warning there was a real test hazard: on a failed `freopen`,
+stderr keeps its original destination, the capture file is never created,
+and every subsequent `Contents()` read returns an empty string — the tests
+would assert against nothing. Fix: the constructor now records capture
+health (`saved_ < 0 || freopen(...) == nullptr` → `capture_ok_ = false`),
+and all six tests `ASSERT_TRUE(cap.Ok())` before reading, so an environment
+failure is loud and attributable instead of a misleading scan verdict.
+
+## F-21 (High, tooling) — the strace syscall check asserted a contract it did not actually measure
+
+Two independent defects in `tools/strace_syscalls.sh`:
+
+(a) *The probe polluted its own measurement.* It used `std::vector` and
+    `std::printf`; glibc services both from its own brk-grown heap. The CI
+    trace showed 5 brk calls: two `brk(NULL)` queries, two break
+    extensions from vector growth during the churn loop, and one exit-time
+    shrink. None of it is FastAlloc behaviour.
+
+(b) *Even allocation-free, the process is not silent.* With stdio and
+    containers removed, an `LD_PRELOAD` tracer attributed exactly one
+    remaining glibc heap request — `malloc(73728)` from libstdc++'s own
+    static initialization, pre-`main` — plus two `brk(NULL)` queries from
+    glibc's malloc setup. A process-wide `brk == 0` assertion therefore
+    measures the C++ runtime, not the allocator, and can never be a stable
+    gate.
+
+Additionally, the "did the probe complete" check ran
+`grep -q "PROBE-DONE" /dev/null` — a no-op that could never fail.
+
+Fix: the probe is rewritten allocation-free (static slot array; raw
+`write(2)` for both markers and completion; no <cstdio>, streams or STL
+containers, with the rationale documented in the script header). It
+brackets the workload with `PROBE-START` / `PROBE-DONE` marker writes, the
+strace invocation traces `memory,write` so the markers land in the log, and
+every assertion is scoped to the syscall lines *between* the markers: in
+that window only FastAlloc and plain computation run, so a brk there is
+attributable to the allocator under test. Assertions: brk-in-window == 0,
+mmap-in-window > 0, madvise+munmap-in-window > 0, plus real completion
+checks (probe exit status, both markers on stdout, both markers in the
+trace). Measured shape: mmap 6, madvise 125, munmap 0, brk 0 in-window;
+control run with the round-2 probe confirms its brk operations fall inside
+the equivalent workload window, i.e. the check still has teeth.
+
+## F-22 (Medium, CI) — `static_analysis.sh` failed even on a fully clean tree
+
+The clang-tidy step redirected only stderr into its log
+(`clang-tidy ... 2> /tmp/tidy.log`). On clang-tidy 18/19 the diagnostics
+themselves are printed on **stdout** (stderr carries only the per-file
+progress lines and the "N warnings generated" counters). Consequences:
+
+- The log was effectively empty: the `!! clang-tidy reported errors:`
+  report grepped a file with no error lines and printed nothing, and the
+  summary line always read "0 clang-tidy warnings".
+- `grep -c "warning:"` exits 1 on zero matches; under
+  `set -euo pipefail` that aborts the script *after* the summary line and
+  *before* `RESULT: STATIC ANALYSIS CLEAN` — so the CI job would exit 1
+  even with a perfect tree. This is a fail-open-turned-fail-closed bug
+  that would have surfaced the moment the round-2 `.clang-tidy` made the
+  tidy step pass.
+
+Fix: diagnostics are captured from stdout (`> /tmp/tidy.log 2>/dev/null` —
+stderr is dropped rather than merged, because `> f 2>&1` interleaves
+unbuffered stderr writes into buffered stdout lines and was observed
+clobbering bytes mid-line); the count uses `|| true` so zero matches no
+longer abort the run; the summary prints the honest warning count plus the
+top five offending checks. Both branches verified: shipped config →
+`RESULT: STATIC ANALYSIS CLEAN`, exit 0; forced-error (round-1) config →
+six reported errors, exit 1.
+
+## F-23 (Low, hygiene) — `src/tls_cache.h` clang-tidy warning surface
+
+The file every tidy run reports first: every in-class member definition
+carried a redundant `inline` specifier (in-class definitions are implicitly
+inline); the five `Count*` statistics helpers and `GetMaxLargeCacheSize`
+used braceless single-statement `if`s; the large-cache cap local was not
+`const`; two implicit boolean conversions (`if (fast_path_cache)` and
+`size ? size : 1`); and `TLSCache` defined a destructor but none of the
+other rule-of-five members. All fixed — the copy/move operations are
+deleted outright with rationale (a placement-new-constructed per-thread
+singleton; `tls_cache.cpp` constructs and destroys it in place and nothing
+copies it). Semantics-neutral: `-Wall -Wextra -Wpedantic -Werror` clean on
+gcc 14 and clang 19, full suite matrix green afterwards.

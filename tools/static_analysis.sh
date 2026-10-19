@@ -63,7 +63,15 @@ if command -v clang-tidy > /dev/null 2>&1; then
     cmake -S . -B "$TIDY_BUILD" -DCMAKE_BUILD_TYPE=Debug \
         -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
         -DFASTALLOC_BUILD_BENCHMARKS=OFF > /dev/null
-    if clang-tidy -p "$TIDY_BUILD" --quiet src/*.cpp 2> /tmp/tidy.log; then
+    # Diagnostics go to stdout; the per-file progress lines and the
+    # "N warnings generated" counters go to stderr. Redirecting both into
+    # ONE file with >f 2>&1 interleaves unbuffered stderr writes into the
+    # middle of buffered stdout lines (observed: bytes clobbered mid-line),
+    # so stderr is dropped instead and the log holds clean diagnostics.
+    # Without the stdout redirect the log would be empty, the error report
+    # below would silently print nothing, and the warning count would
+    # always read 0.
+    if clang-tidy -p "$TIDY_BUILD" --quiet src/*.cpp > /tmp/tidy.log 2>/dev/null; then
         :
     else
         echo "!! clang-tidy reported errors:" >&2
@@ -71,8 +79,17 @@ if command -v clang-tidy > /dev/null 2>&1; then
         FAIL=1
     fi
     # Summarise warnings but do not fail the run on style suggestions.
-    grep -cE "warning:" /tmp/tidy.log 2>/dev/null | \
-        xargs -I{} echo "    {} clang-tidy warnings (see /tmp/tidy.log)"
+    # grep -c exits 1 on zero matches, which would abort this script under
+    # set -e/pipefail - hence the || true and the plain echo.
+    TIDY_WARN_COUNT=$(grep -cE "warning:" /tmp/tidy.log || true)
+    echo "    ${TIDY_WARN_COUNT} clang-tidy warnings (see /tmp/tidy.log)"
+    if [ "${TIDY_WARN_COUNT}" -gt 0 ]; then
+        # Top offending checks, so a CI log reader can see the shape of the
+        # noise without opening the full log.
+        grep -oE '\[[a-z0-9-]+-[a-z0-9-]+-[a-z0-9-]+\]$|\[[a-z0-9-]+-[a-z0-9-]+\]$' \
+            /tmp/tidy.log | sort | uniq -c | sort -rn | head -5 | \
+            sed 's/^/      /'
+    fi
 else
     echo "(clang-tidy not installed - skipped)"
 fi

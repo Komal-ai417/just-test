@@ -109,6 +109,23 @@ if(FASTALLOC_OVERRIDE_NEW)
 endif()
 
 # ---------------------------------------------------------------------------
+# Coverage instrumentation (gcc/clang gcov)
+#
+# The flags must be on the directory scope BEFORE any target is created:
+# add_compile_options() only reaches targets defined after the call, so a
+# block at the bottom of this file would leave the library and the test
+# binaries completely uninstrumented (and the report empty).
+# ---------------------------------------------------------------------------
+if(FASTALLOC_COVERAGE)
+    if(MSVC)
+        message(WARNING "FASTALLOC_COVERAGE is GCC/Clang-only; ignoring.")
+    else()
+        add_compile_options(--coverage -fprofile-arcs -ftest-coverage -g)
+        add_link_options(--coverage)
+    endif()
+endif()
+
+# ---------------------------------------------------------------------------
 # Core Library
 # ---------------------------------------------------------------------------
 add_library(fast_alloc STATIC
@@ -123,6 +140,24 @@ target_compile_options(fast_alloc PRIVATE ${WARNING_FLAGS})
 target_link_libraries(fast_alloc PUBLIC Threads::Threads)
 
 target_include_directories(fast_alloc PUBLIC include src)
+
+# ---------------------------------------------------------------------------
+# MemorySanitizer smoke harness
+#
+# A gtest-free, STL-container-free main() that exercises every public API
+# entry point (malloc/free/calloc/realloc/aligned/free_sized, stats, purge,
+# cross-thread hand-off). MSan requires every linked library to be
+# instrumented; gtest and the C++ runtime are not, so the MSan gate is this
+# harness built with clang -fsanitize=memory (tools/msan_check.sh) rather
+# than the gtest suites. On every other platform it is a cheap extra smoke
+# test that ctest runs alongside the suites.
+# ---------------------------------------------------------------------------
+add_executable(fast_alloc_msan_harness tests/msan_harness.cpp)
+target_compile_options(fast_alloc_msan_harness PRIVATE ${WARNING_FLAGS})
+target_link_libraries(fast_alloc_msan_harness PRIVATE fast_alloc)
+fastalloc_stage_asan_runtime(fast_alloc_msan_harness)
+include(CTest)
+add_test(NAME fast_alloc_msan_harness COMMAND fast_alloc_msan_harness)
 
 # ---------------------------------------------------------------------------
 # Dependencies (GTest and GBenchmark)
@@ -293,7 +328,9 @@ endif()
 
 include(CheckIPOSupported)
 check_ipo_supported(RESULT lto_supported)
-if(lto_supported AND NOT FASTALLOC_SANITIZE)
+# LTO is skipped under sanitizers (toolchain support varies) and under
+# coverage (LTO's split dwarf/gcda handoff yields unreliable line data).
+if(lto_supported AND NOT FASTALLOC_SANITIZE AND NOT FASTALLOC_COVERAGE)
     set_property(TARGET fast_alloc PROPERTY INTERPROCEDURAL_OPTIMIZATION TRUE)
     if(FASTALLOC_BUILD_TESTS)
         # Death tests (fork) + LTO is fine, but keep tests non-LTO for
@@ -311,33 +348,18 @@ if(lto_supported AND NOT FASTALLOC_SANITIZE)
 endif()
 
 # ---------------------------------------------------------------------------
-# Coverage (gcc): gcov instrumentation + a `coverage` target that runs the
-# test suites and produces a per-file line-coverage report via gcovr when
-# available (falls back to raw gcov summaries otherwise).
+# Coverage (gcc): the `coverage` target runs the test suites and produces the
+# per-file line-coverage report via tools/coverage_report.sh (gcovr 5-8
+# compatible invocation; the script owns the flag set so CMake and CI share
+# one tested code path).
 # ---------------------------------------------------------------------------
-if(FASTALLOC_COVERAGE)
-    if(MSVC)
-        message(WARNING "FASTALLOC_COVERAGE is GCC/Clang-only; ignoring.")
-    else()
-        add_compile_options(--coverage -fprofile-arcs -ftest-coverage -g)
-        add_link_options(--coverage)
-        find_program(GCOVR_EXECUTABLE gcovr)
-        add_custom_target(coverage
-            COMMAND ${CMAKE_CTEST_COMMAND} --output-on-failure
-            COMMAND ${GCOVR_EXECUTABLE} -r ${CMAKE_SOURCE_DIR}
-                     --object-directory ${CMAKE_BINARY_DIR}
-                     -e "${CMAKE_SOURCE_DIR}/tests/.*"
-                     -e "${CMAKE_SOURCE_DIR}/_deps/.*"
-                     -e "${CMAKE_SOURCE_DIR}/fuzz/.*"
-                     -e ".*CompilerId.*"
-                     --gcov-ignore-parse-errors negative_hits.warn
-                     --merge-mode-functions separate
-                     --txt -s
-            COMMENT "Running tests and generating gcov coverage report"
-            USES_TERMINAL
-        )
-        if(NOT GCOVR_EXECUTABLE)
-            message(STATUS "gcovr not found: the coverage target will run the tests but skip the report (pip install gcovr to enable)")
-        endif()
-    endif()
+if(FASTALLOC_COVERAGE AND NOT MSVC)
+    add_custom_target(coverage
+        COMMAND ${CMAKE_CTEST_COMMAND} --output-on-failure
+        COMMAND bash ${CMAKE_SOURCE_DIR}/tools/coverage_report.sh
+                ${CMAKE_BINARY_DIR}
+        WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+        COMMENT "Running tests and generating gcov coverage report"
+        USES_TERMINAL
+    )
 endif()

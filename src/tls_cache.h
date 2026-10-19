@@ -46,13 +46,15 @@ std::size_t AuditCurrentThreadCache(const void* lo, const void* hi);
 
 class TLSCache {
 public:
-    static inline TLSCache& GetFast() {
-        if (fast_path_cache) return *fast_path_cache;
+    static TLSCache& GetFast() {
+        if (fast_path_cache != nullptr) {
+            return *fast_path_cache;
+        }
         return GetSlow();
     }
     static TLSCache& GetSlow();
 
-    inline void* AllocateBlock(std::size_t class_index) {
+    void* AllocateBlock(std::size_t class_index) {
         CacheBin& bin = bins_[class_index];
         FreeBlock* block = bin.head;
         // Verify head pointer plausibility before dereferencing next pointer.
@@ -79,7 +81,7 @@ public:
     // returns false when the push was dropped by the plausibility guard or
     // absorbed by the duplicate-head guard, in which case the caller must not
     // count the block as returned to the cache.
-    inline bool DeallocateBlock(std::size_t class_index, FreeBlock* block) {
+    bool DeallocateBlock(std::size_t class_index, FreeBlock* block) {
         // Validate block pointer plausibility before linking into bin.
         if (FAST_UNLIKELY(!IsPlausibleHeapPtr(block))) {
             ReportWildFreelistLink("DeallocateBlock(push)", class_index,
@@ -122,33 +124,51 @@ public:
     // stats() calls and at thread exit. Keeps the alloc/free fast path free
     // of shared cache-line traffic.
     // ------------------------------------------------------------------
-    inline void CountSmallAlloc(std::size_t bytes) {
+    void CountSmallAlloc(std::size_t bytes) {
         ++stats_.small_allocs;
         stats_.small_alloc_bytes += bytes;
-        if (++stats_.ops >= kStatsFlushOps) FlushStats();
+        if (++stats_.ops >= kStatsFlushOps) {
+            FlushStats();
+        }
     }
-    inline void CountSmallFree(std::size_t bytes) {
+    void CountSmallFree(std::size_t bytes) {
         ++stats_.small_frees;
         stats_.small_free_bytes += bytes;
-        if (++stats_.ops >= kStatsFlushOps) FlushStats();
+        if (++stats_.ops >= kStatsFlushOps) {
+            FlushStats();
+        }
     }
-    inline void CountLargeAlloc(std::size_t bytes) {
+    void CountLargeAlloc(std::size_t bytes) {
         ++stats_.large_allocs;
         stats_.large_alloc_bytes += bytes;
-        if (++stats_.ops >= kStatsFlushOps) FlushStats();
+        if (++stats_.ops >= kStatsFlushOps) {
+            FlushStats();
+        }
     }
-    inline void CountLargeFree(std::size_t bytes) {
+    void CountLargeFree(std::size_t bytes) {
         ++stats_.large_frees;
         stats_.large_free_bytes += bytes;
-        if (++stats_.ops >= kStatsFlushOps) FlushStats();
+        if (++stats_.ops >= kStatsFlushOps) {
+            FlushStats();
+        }
     }
-    inline void CountRealloc() {
+    void CountRealloc() {
         ++stats_.reallocs;
-        if (++stats_.ops >= kStatsFlushOps) FlushStats();
+        if (++stats_.ops >= kStatsFlushOps) {
+            FlushStats();
+        }
     }
     void FlushStats();
 
     ~TLSCache();
+
+    // One cache per thread, constructed in place by GetSlow(); copying or
+    // moving a cache would double-own its parked blocks, so the rule-of-five
+    // special members are deleted outright.
+    TLSCache(const TLSCache&) = delete;
+    TLSCache& operator=(const TLSCache&) = delete;
+    TLSCache(TLSCache&&) = delete;
+    TLSCache& operator=(TLSCache&&) = delete;
 
 private:
     TLSCache();
@@ -173,12 +193,19 @@ private:
         std::size_t alloc_size;
     };
 
-    static inline std::size_t GetMaxLargeCacheSize(std::size_t size) {
+    static std::size_t GetMaxLargeCacheSize(std::size_t size) {
         // Per-class retention cap: ~2 MB of spans per large class per thread,
-        // bounded between 4 and 64 entries.
-        std::size_t count = (std::size_t{2} * 1024 * 1024) / (size ? size : 1);
-        if (count < 4) return 4;
-        if (count > 64) return 64;
+        // bounded between 4 and 64 entries. The explicit != 0 keeps the
+        // division safe for a hypothetical zero-size class without an
+        // implicit size_t -> bool conversion.
+        const std::size_t count =
+            (std::size_t{2} * 1024 * 1024) / (size != 0 ? size : std::size_t{1});
+        if (count < 4) {
+            return 4;
+        }
+        if (count > 64) {
+            return 64;
+        }
         return count;
     }
 

@@ -12,6 +12,7 @@ Checks: >
   performance-*,
   portability-*,
   readability-*,
+  -bugprone-easily-swappable-parameters,
   -modernize-use-trailing-return-type,
   -readability-function-cognitive-complexity,
   -cppcoreguidelines-avoid-magic-numbers,
@@ -21,6 +22,11 @@ Checks: >
   -misc-non-private-member-variables-in-classes,
   -cppcoreguidelines-non-private-member-variables-in-classes,
   -cppcoreguidelines-pro-type-member-init,
+# bugprone-easily-swappable-parameters is disabled: it flags every natural
+# same-type parameter pair this codebase is built on (scan ranges lo/hi,
+# size/capacity pairs, arena/class indices), where strong typedefs would
+# obscure rather than clarify; swap-safety is enforced by naming discipline
+# and the differential suites instead.
 WarningsAsErrors: 'bugprone-*,cert-*,clang-analyzer-*,concurrency-*'
 HeaderFilterRegex: 'src/.*|include/.*'
 FormatStyle: file

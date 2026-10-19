@@ -74,13 +74,29 @@ public:
         fd_ = CaptureFileno(stderr);
         std::fflush(stderr);
         saved_ = CaptureDup(fd_);
-        std::freopen(path_.c_str(), "w", stderr);
+        // freopen() is declared with __wur (warn_unused_result) in glibc - a
+        // fatal error under -Werror on Ubuntu CI when the result is ignored.
+        // Handling it also matters semantically: on failure stderr keeps its
+        // original destination, the capture file is never created, and every
+        // later Contents() read would silently return an empty string. A
+        // missing saved descriptor is equally unrecoverable (the original
+        // stderr could not be restored), so both cases mark the capture
+        // unhealthy and the tests report that loudly via Ok().
+        if (saved_ < 0 || std::freopen(path_.c_str(), "w", stderr) == nullptr) {
+            capture_ok_ = false;
+            return;
+        }
         std::setvbuf(stderr, nullptr, _IONBF, 0);
     }
     ~StderrCapture() {
         Restore();
         std::remove(path_.c_str());
     }
+    // True when stderr was actually re-bound to the capture file. Tests
+    // must ASSERT on this before reading Contents(): a failed capture is an
+    // environment problem, not an allocator verdict.
+    bool Ok() const { return capture_ok_; }
+
     std::string Contents() {
         std::fflush(stderr);
         FILE* f = std::fopen(path_.c_str(), "r");
@@ -108,6 +124,7 @@ private:
         return n++;
     }
     std::string path_;
+    bool capture_ok_ = true;
     int fd_ = -1;
     int saved_ = -1;
 };
@@ -125,6 +142,7 @@ TEST(AuditScan, TlsBinHeadInRangeIsReported) {
     char* block_base = static_cast<char*>(p) - 16;
 
     StderrCapture cap;
+    ASSERT_TRUE(cap.Ok()) << "stderr capture setup failed (freopen/dup)";
     fast_alloc_audit_pointers(block_base, block_base + 16);
     std::string out = cap.Contents();
     EXPECT_NE(out.find("tls bin"), std::string::npos)
@@ -136,6 +154,7 @@ TEST(AuditScan, TlsBinHeadInRangeIsReported) {
 TEST(AuditScan, UnrelatedRangeReportsNoHits) {
     // A mapped but unused address range: no head pointer can target it.
     StderrCapture cap;
+    ASSERT_TRUE(cap.Ok()) << "stderr capture setup failed (freopen/dup)";
     fast_alloc_audit_pointers(reinterpret_cast<const void*>(0x10000),
                               reinterpret_cast<const void*>(0x20000));
     std::string out = cap.Contents();
@@ -147,16 +166,19 @@ TEST(AuditScan, UnrelatedRangeReportsNoHits) {
 TEST(AuditScan, InvalidRangesAreSilentNoops) {
     {
         StderrCapture cap;
+        ASSERT_TRUE(cap.Ok()) << "stderr capture setup failed (freopen/dup)";
         fast_alloc_audit_pointers(nullptr, reinterpret_cast<const void*>(0x10000));
         EXPECT_TRUE(cap.Contents().empty()) << "null lo must return early";
     }
     {
         StderrCapture cap;
+        ASSERT_TRUE(cap.Ok()) << "stderr capture setup failed (freopen/dup)";
         fast_alloc_audit_pointers(reinterpret_cast<const void*>(0x10000), nullptr);
         EXPECT_TRUE(cap.Contents().empty()) << "null hi must return early";
     }
     {
         StderrCapture cap;
+        ASSERT_TRUE(cap.Ok()) << "stderr capture setup failed (freopen/dup)";
         fast_alloc_audit_pointers(reinterpret_cast<const void*>(0x20000),
                                   reinterpret_cast<const void*>(0x10000));
         EXPECT_TRUE(cap.Contents().empty()) << "inverted range must return early";
@@ -180,6 +202,7 @@ TEST(AuditScan, PageBinHeadInRangeIsReported) {
     char* span_base = reinterpret_cast<char*>(p) - 16;
 
     StderrCapture cap;
+    ASSERT_TRUE(cap.Ok()) << "stderr capture setup failed (freopen/dup)";
     fast_alloc_audit_pointers(span_base, span_base + 16);
     std::string out = cap.Contents();
     EXPECT_NE(out.find("page bin"), std::string::npos)
@@ -199,6 +222,7 @@ TEST(AuditScan, LiveRangeAroundAllocatedBlockIsQuiet) {
     ASSERT_NE(p, nullptr);
     {
         StderrCapture cap;
+        ASSERT_TRUE(cap.Ok()) << "stderr capture setup failed (freopen/dup)";
         fast_alloc_audit_pointers(p, static_cast<char*>(p) + 8192);
         (void)cap.Contents();
     }
