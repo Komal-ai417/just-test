@@ -111,10 +111,11 @@ jobs:
                 -DFASTALLOC_BUILD_TESTS=ON `
                 -DFASTALLOC_SANITIZE=address
       - name: Build
-        # BOTH gtest binaries: ctest runs every registered test, and the
-        # audit suite (fast_alloc_audit_tests) is registered too — building
-        # only fast_alloc_tests would leave it "Not Run" and fail the job.
-        run: cmake --build build --config Release -j --target fast_alloc_tests fast_alloc_audit_tests
+        # BOTH gtest binaries + the MSan/smoke harness: ctest runs every
+        # registered test, and the audit suite (fast_alloc_audit_tests) and
+        # fast_alloc_msan_harness are registered too — building only
+        # fast_alloc_tests would leave them "Not Run" and fail the job.
+        run: cmake --build build --config Release -j --target fast_alloc_tests fast_alloc_audit_tests fast_alloc_msan_harness
       - name: Stage MSVC ASan runtime + symbolizer (v12)
         shell: pwsh
         run: |
@@ -275,9 +276,10 @@ jobs:
           -DCMAKE_CXX_FLAGS="-DFASTALLOC_WINVA_EMULATION"
 
       - name: Build
-        # Both gtest binaries — ctest runs every registered test (see
-        # windows-asan note): the audit suite must be built too.
-        run: cmake --build build -j --target fast_alloc_tests fast_alloc_audit_tests
+        # Both gtest binaries + the MSan/smoke harness — ctest runs every
+        # registered test (see windows-asan note): the audit suite must be
+        # built too.
+        run: cmake --build build -j --target fast_alloc_tests fast_alloc_audit_tests fast_alloc_msan_harness
 
       - name: Test
         run: ctest --test-dir build --output-on-failure
@@ -811,7 +813,11 @@ jobs:
       - name: Build
         run: cmake --build build -j --target fast_alloc_tests fast_alloc_override_tests
       - name: Test (override suite + validate suite)
-        run: ctest --test-dir build --output-on-failure
+        # The audit suite is intentionally NOT built here (its differential
+        # tests compare against the system allocator, which the global
+        # new/delete override replaces); -R keeps ctest to the binaries
+        # this job actually builds.
+        run: ctest --test-dir build --output-on-failure -R "fast_alloc_validate_tests|fast_alloc_override_new_tests"
         env:
           ASAN_OPTIONS: allocator_may_return_null=1
 
@@ -826,23 +832,22 @@ jobs:
     timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
-      - name: Install gcovr
-        run: pipx install gcovr || pip install gcovr
+      - name: Install gcovr (pinned)
+        # Pinned: tools/coverage_report.sh's flag set is verified against
+        # gcovr 5-8, and future majors have historically removed flags
+        # (--branches died in 7, --object-directory was demoted in 8).
+        run: pipx install 'gcovr==8.7' || pip install 'gcovr==8.7'
       - name: Configure (coverage instrumentation)
         run: >
           cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug
           -DFASTALLOC_COVERAGE=ON -DFASTALLOC_BUILD_BENCHMARKS=OFF
           -DFASTALLOC_BUILD_FUZZ=OFF
       - name: Build suites
-        run: cmake --build build -j --target fast_alloc_tests fast_alloc_audit_tests
+        run: cmake --build build -j --target fast_alloc_tests fast_alloc_audit_tests fast_alloc_msan_harness
       - name: Run tests + generate report
         run: |
           ctest --test-dir build --output-on-failure
-          gcovr -r . --object-directory build \
-            -e '.*tests/.*' -e '.*_deps/.*' -e '.*fuzz/.*' -e '.*CompilerId.*' \
-            --gcov-ignore-parse-errors negative_hits.warn \
-            --merge-mode-functions separate \
-            --txt -s --branches --xml coverage.xml | tee coverage_summary.txt
+          bash tools/coverage_report.sh build | tee coverage_summary.txt
       - name: Coverage gate (core allocator lines >= 70%)
         run: |
           # The release-only guard branches keep the total below 100%; the
@@ -884,8 +889,10 @@ jobs:
         run: bash tools/static_analysis.sh
 
   # ---------------------------------------------------------------------------
-  # MemorySanitizer (clang-only): uninitialized-memory read detection on the
-  # deterministic validate subset.
+  # MemorySanitizer (clang-only): uninitialized-memory read detection via
+  # the gtest-free / STL-free smoke harness (every public API entry point,
+  # cross-thread pending hand-off, purge paths) built with
+  # -fsanitize=memory -fsanitize-memory-track-origins=2.
   # ---------------------------------------------------------------------------
   msan:
     name: memory-sanitizer

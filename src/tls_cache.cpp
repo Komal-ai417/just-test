@@ -21,7 +21,7 @@ std::atomic<std::uint64_t> g_bin_heal_events{0};
 
 void PrintInvariantEvent(const char* kind, std::size_t class_index,
                           std::uint32_t claimed, std::size_t actual) {
-    std::fprintf(stderr,
+    (void)std::fprintf(stderr,
                  "[fastalloc-invariant] %s: class=%zu count=%u list=%zu "
                  "(duplicate hand-out/free upstream); guarded, self-healed. "
                  "Total guard=%llu heal=%llu\n",
@@ -30,7 +30,7 @@ void PrintInvariantEvent(const char* kind, std::size_t class_index,
                      std::memory_order_relaxed),
                  (unsigned long long)g_bin_heal_events.load(
                      std::memory_order_relaxed));
-    std::fflush(stderr);
+    (void)std::fflush(stderr);
 }
 
 } // namespace
@@ -47,13 +47,13 @@ void ReportDoublePushGuard() {
 void ReportBinHeadCorruption(std::size_t class_index, std::uintptr_t bad_head) {
     static std::atomic<bool> reported{false};
     if (!reported.exchange(true, std::memory_order_relaxed)) {
-        std::fprintf(stderr,
+        (void)std::fprintf(stderr,
                      "[fastalloc-invariant] corrupt TLS bin head: class=%zu "
                      "head=%#zx (< 64 KB; never a FastAlloc block). Bin "
                      "re-derived from a fresh batch, allocator state "
                      "protected.\n",
                      class_index, bad_head);
-        std::fflush(stderr);
+        (void)std::fflush(stderr);
     }
 }
 
@@ -62,12 +62,12 @@ void ReportWildFreelistLink(const char* where, std::size_t class_index,
                              std::uintptr_t bad_link) {
     static std::atomic<bool> reported{false};
     if (!reported.exchange(true, std::memory_order_relaxed)) {
-        std::fprintf(stderr,
+        (void)std::fprintf(stderr,
                      "[fastalloc-invariant] wild freelist value at %s: "
                      "class=%zu value=%#zx (fails <64KB / <2^47 / 16-aligned "
                      "plausibility). Dropped, allocator state protected.\n",
                      where, class_index, bad_link);
-        std::fflush(stderr);
+        (void)std::fflush(stderr);
     }
 }
 
@@ -175,7 +175,7 @@ static void WINAPI FlsCleanupCallback(PVOID ptr) {
 void TLSCache::InitTlsKey() {
     tls_key_ = FlsAlloc(FlsCleanupCallback);
     if (tls_key_ == FLS_OUT_OF_INDEXES) {
-        std::fprintf(stderr,
+        (void)std::fprintf(stderr,
             "FastAlloc FATAL: FlsAlloc failed (no FLS slots left). "
             "Refusing to continue with broken TLS - aborting.\n");
         std::abort();
@@ -207,7 +207,7 @@ void TLSCache::InitTlsKey() {
         // key is a valid key number that can belong to another library, and
         // pthread_getspecific on it can return foreign data we would
         // reinterpret as TLSCache*. Fail loudly instead of corrupting.
-        std::fprintf(stderr,
+        (void)std::fprintf(stderr,
             "FastAlloc FATAL: pthread_key_create failed (rc=%d). "
             "Refusing to continue with broken TLS - aborting.\n", rc);
         std::abort();
@@ -239,14 +239,14 @@ TLSCache& TLSCache::GetSlow() {
     void* mem = CachePoolInstance().Pop();
     if (!mem) mem = OSMemory::AllocatePages(alloc_size);
     if (FAST_UNLIKELY(!mem)) {
-        std::fprintf(stderr, "FastAlloc FATAL: cannot map memory for thread cache - aborting.\n");
+        (void)std::fprintf(stderr, "FastAlloc FATAL: cannot map memory for thread cache - aborting.\n");
         std::abort();
     }
     TLSCache* cache = new (mem) TLSCache();
     if (FAST_UNLIKELY(!FlsSetValue(tls_key_, cache))) {
         // Degrade gracefully: this thread keeps a working cache through
         // fast_path_cache, but the destructor will never run - log it.
-        std::fprintf(stderr,
+        (void)std::fprintf(stderr,
             "FastAlloc ERROR: FlsSetValue failed; thread cache will not be "
             "reclaimed at thread exit (memory retention).\n");
     }
@@ -264,7 +264,7 @@ TLSCache& TLSCache::GetSlow() {
     void* mem = CachePoolInstance().Pop();
     if (!mem) mem = OSMemory::AllocatePages(alloc_size);
     if (FAST_UNLIKELY(!mem)) {
-        std::fprintf(stderr, "FastAlloc FATAL: cannot mmap memory for thread cache - aborting.\n");
+        (void)std::fprintf(stderr, "FastAlloc FATAL: cannot mmap memory for thread cache - aborting.\n");
         std::abort();
     }
     TLSCache* cache = new (mem) TLSCache();
@@ -272,7 +272,7 @@ TLSCache& TLSCache::GetSlow() {
     if (FAST_UNLIKELY(rc != 0)) {
         // Degrade gracefully: this thread keeps a working cache through
         // fast_path_cache, but the destructor will never run - log it.
-        std::fprintf(stderr,
+        (void)std::fprintf(stderr,
             "FastAlloc ERROR: pthread_setspecific failed (rc=%d); thread cache "
             "will not be reclaimed at thread exit (memory retention).\n", rc);
     }
@@ -533,7 +533,7 @@ std::size_t TLSCache::AuditPointers(const void* lo, const void* hi) const {
                 reinterpret_cast<std::uintptr_t>(lo) &&
             reinterpret_cast<std::uintptr_t>(head) <
                 reinterpret_cast<std::uintptr_t>(hi)) {
-            std::fprintf(stderr,
+            (void)std::fprintf(stderr,
                          "[fastalloc-audit] tls bin class=%zu head=%p -> IN RANGE\n",
                          c, static_cast<void*>(const_cast<FreeBlock*>(head)));
             ++hits;
@@ -545,7 +545,7 @@ std::size_t TLSCache::AuditPointers(const void* lo, const void* hi) const {
                 reinterpret_cast<std::uintptr_t>(lo) &&
             reinterpret_cast<std::uintptr_t>(entry) <
                 reinterpret_cast<std::uintptr_t>(hi)) {
-            std::fprintf(stderr,
+            (void)std::fprintf(stderr,
                          "[fastalloc-audit] tls large bin %zu head=%p -> IN RANGE\n",
                          i, static_cast<void*>(const_cast<LargeFreeEntry*>(entry)));
             ++hits;
@@ -567,7 +567,7 @@ std::size_t AuditCurrentThreadCache(const void* lo, const void* hi) {
                 reinterpret_cast<std::uintptr_t>(lo) &&
             reinterpret_cast<std::uintptr_t>(c) <
                 reinterpret_cast<std::uintptr_t>(hi)) {
-            std::fprintf(stderr,
+            (void)std::fprintf(stderr,
                          "[fastalloc-audit] cache pool slot %zu = %p -> IN RANGE\n",
                          i, static_cast<void*>(c));
             ++hits;

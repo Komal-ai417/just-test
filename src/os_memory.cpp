@@ -191,14 +191,14 @@ WinReservationRegistry& WinRegistry() {
 void WinVaInstallSegvHandler() {
     struct sigaction sa {};
     sa.sa_sigaction = [](int sig, siginfo_t* info, void*) {
-        std::fprintf(stderr,
+        (void)std::fprintf(stderr,
                      "\n[winva] *** SIGSEGV (Windows 0xC0000005 equivalent) "
                      "faulting address=%p ***\n",
                      info ? info->si_addr : nullptr);
         void* frames[40];
         int n = backtrace(frames, 40);
         backtrace_symbols_fd(frames, n, 2);
-        std::fflush(stderr);
+        (void)std::fflush(stderr);
         std::_Exit(128 + sig);
     };
     sa.sa_flags = SA_SIGINFO;
@@ -247,8 +247,8 @@ void WinVaInstallSegvHandler() {
 
 namespace {
 
-constexpr std::size_t kChunkSize = 4 * 1024 * 1024;          // per-chunk mapping
-constexpr std::size_t kMaxPooledSpan = 2 * 1024 * 1024;      // <= page-cache span cap
+constexpr std::size_t kChunkSize = std::size_t{4} * 1024 * 1024;   // per-chunk mapping
+constexpr std::size_t kMaxPooledSpan = std::size_t{2} * 1024 * 1024; // <= page-cache span cap
 constexpr std::size_t kMaxChunks = 64;                       // 256 MB address-space cap
 
 struct Chunk {

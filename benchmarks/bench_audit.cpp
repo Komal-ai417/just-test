@@ -18,6 +18,10 @@
 #include <thread>
 #include <vector>
 
+#ifdef _WIN32
+#include <malloc.h>
+#endif
+
 #ifdef USE_GLIBC
 namespace fa {
 inline void* malloc(std::size_t n) { return std::malloc(n); }
@@ -26,7 +30,22 @@ inline void* realloc(void* p, std::size_t n) { return std::realloc(p, n); }
 inline void* calloc(std::size_t a, std::size_t b) { return std::calloc(a, b); }
 inline void* aligned_alloc(std::size_t a, std::size_t n) {
     if (n == 0) n = 1;
+#ifdef _WIN32
+    // The MSVC CRT has no (std::)aligned_alloc; _aligned_malloc pairs with
+    // _aligned_free in aligned_free() below.
+    return _aligned_malloc(n, a);
+#else
+    // C11 aligned_alloc demands a size that is a multiple of the alignment.
+    n = (n + a - 1) / a * a;
     return std::aligned_alloc(a, n);
+#endif
+}
+inline void aligned_free(void* p) {
+#ifdef _WIN32
+    _aligned_free(p);
+#else
+    std::free(p);
+#endif
 }
 inline void purge() {}
 const char* name() { return "glibc"; }
@@ -40,6 +59,7 @@ inline void* calloc(std::size_t a, std::size_t b) { return FastAlloc::fast_callo
 inline void* aligned_alloc(std::size_t a, std::size_t n) {
     return FastAlloc::fast_aligned_alloc(a, n);
 }
+inline void aligned_free(void* p) { FastAlloc::fast_free(p); }
 inline void purge() { FastAlloc::fast_alloc_purge(); }
 const char* name() { return "FastAlloc"; }
 }  // namespace fa
@@ -130,7 +150,7 @@ static void LatencySuite(bool cold) {
                 double t0 = NowNs();
                 void* p = fa::aligned_alloc(256, 512);
                 double t1 = NowNs();
-                if (p) { al.push_back(t1 - t0); fa::free(p); }
+                if (p) { al.push_back(t1 - t0); fa::aligned_free(p); }
             }
         PrintPct("realloc(64->128)", rl);
         PrintPct("calloc(8x64)", cl);

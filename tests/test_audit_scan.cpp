@@ -16,9 +16,10 @@
 #include <cstdlib>
 #include <cstring>
 #include <string>
-#include <vector>
 
-#ifndef _WIN32
+#ifdef _WIN32
+#include <io.h>
+#else
 #include <unistd.h>
 #endif
 
@@ -26,30 +27,62 @@ using namespace FastAlloc;
 
 namespace {
 
+// CRT descriptor helpers. MSVC deprecates the POSIX spellings (dup/dup2/
+// fileno/close -> C4996, an error under /W4 /WX), so the ISO underscore
+// names are used there; every other platform takes the POSIX names.
+inline int CaptureDup(int fd) {
+#ifdef _WIN32
+    return _dup(fd);
+#else
+    return dup(fd);
+#endif
+}
+inline int CaptureDup2(int src, int dst) {
+#ifdef _WIN32
+    return _dup2(src, dst);
+#else
+    return dup2(src, dst);
+#endif
+}
+inline int CaptureClose(int fd) {
+#ifdef _WIN32
+    return _close(fd);
+#else
+    return close(fd);
+#endif
+}
+inline int CaptureFileno(std::FILE* f) {
+#ifdef _WIN32
+    return _fileno(f);
+#else
+    return fileno(f);
+#endif
+}
+
 // Redirects stderr to a temporary file for the duration of one scan, then
-// restores it and returns everything written. POSIX only; the whole file is
-// skipped on Windows (the scan itself works there, but the capture plumbing
-// below uses dup/dup2).
+// restores the original destination and hands back everything written.
+//
+// freopen() re-binds the same FILE object (it stays a valid `stderr`
+// expression on every platform - MSVC's stderr is a macro and cannot be
+// reassigned), and the descriptor saved by dup() is re-attached with dup2()
+// on destruction. No fclose/fdopen dance: the FILE never closes.
 class StderrCapture {
 public:
     StderrCapture() {
-        Path();
-        fflush(stderr);
-        saved_ = dup(kFd);
-        file_ = std::freopen(path_.c_str(), "w", stderr);
-        setvbuf(stderr, nullptr, _IONBF, 0);
+        path_ = testing::TempDir() + "fastalloc_audit_scan_" +
+                std::to_string(NextSerial()) + ".err";
+        fd_ = CaptureFileno(stderr);
+        std::fflush(stderr);
+        saved_ = CaptureDup(fd_);
+        std::freopen(path_.c_str(), "w", stderr);
+        std::setvbuf(stderr, nullptr, _IONBF, 0);
     }
     ~StderrCapture() {
-        fflush(stderr);
-        if (file_) std::fclose(stderr);
-        stderr = reinterpret_cast<FILE*>(stdout);  // placeholder before dup2 restores
-        dup2(saved_, kFd);
-        stderr = fdopen(kFd, "w");
-        clearerr(stderr);
+        Restore();
         std::remove(path_.c_str());
     }
     std::string Contents() {
-        fflush(stderr);
+        std::fflush(stderr);
         FILE* f = std::fopen(path_.c_str(), "r");
         if (!f) return {};
         std::string out;
@@ -60,23 +93,26 @@ public:
     }
 
 private:
-    static constexpr int kFd = 2;
-    // Per-process capture file so parallel test binaries never collide.
-    const std::string& Path() {
-        if (path_.empty()) {
-            path_ = std::string("/tmp/fastalloc_audit_scan_") +
-                    std::to_string(static_cast<long>(getpid())) + ".err";
+    void Restore() {
+        std::fflush(stderr);
+        if (saved_ >= 0) {
+            CaptureDup2(saved_, fd_);
+            CaptureClose(saved_);
+            saved_ = -1;
         }
-        return path_;
+        std::clearerr(stderr);
+    }
+    // Per-process capture file so parallel test binaries never collide.
+    static unsigned NextSerial() {
+        static unsigned n = 0;
+        return n++;
     }
     std::string path_;
+    int fd_ = -1;
     int saved_ = -1;
-    FILE* file_ = nullptr;
 };
 
 } // namespace
-
-#ifndef _WIN32
 
 TEST(AuditScan, TlsBinHeadInRangeIsReported) {
     // Free a block of a cold class: its BLOCK BASE (user pointer - 16) becomes
@@ -170,5 +206,3 @@ TEST(AuditScan, LiveRangeAroundAllocatedBlockIsQuiet) {
     fast_free(p);
     SUCCEED();
 }
-
-#endif // !_WIN32

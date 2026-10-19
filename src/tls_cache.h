@@ -176,7 +176,7 @@ private:
     static inline std::size_t GetMaxLargeCacheSize(std::size_t size) {
         // Per-class retention cap: ~2 MB of spans per large class per thread,
         // bounded between 4 and 64 entries.
-        std::size_t count = (2 * 1024 * 1024) / (size ? size : 1);
+        std::size_t count = (std::size_t{2} * 1024 * 1024) / (size ? size : 1);
         if (count < 4) return 4;
         if (count > 64) return 64;
         return count;

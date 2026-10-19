@@ -22,7 +22,8 @@ bash tools/<script>.sh [args]
 | `perf_c2c.sh` | perf (>= 3.x with c2c) | Cache-line-to-cache-line contention / false-sharing report for the multi-threaded churn. |
 | `strace_syscalls.sh` | strace | Validates OS interaction: counts mmap/munmap/madvise/mremap (and brk absence) across a workload; asserts the purge path actually releases spans. |
 | `heaptrack.sh` | heaptrack | Allocation-hotspot + heap-growth profile of the memory benchmark. |
-| `msan_check.sh` | clang | MemorySanitizer build + full test suite (uninitialized-read detection; clang-only - see the script header). |
+| `msan_check.sh` | clang, cmake | MemorySanitizer build of the gtest-free/STL-free smoke harness (`tests/msan_harness.cpp`, every public API entry point incl. cross-thread hand-off) with origin tracking; clang-only - see the script header. |
+| `coverage_report.sh` | gcovr | gcovr line/branch/function report over the allocator core for a `-DFASTALLOC_COVERAGE=ON` build whose tests already ran; flag set verified against gcovr 5-8 (CI pins 8.7). Writes `coverage.xml` + the summary the CI 70% gate parses. |
 | `static_analysis.sh` | cppcheck and/or clang-tidy | Both analysers over `src/`, `include/`, `tests/`, `benchmarks/`, `fuzz/` with warning-as-failure thresholds. |
 | `mutation_test.sh` | gcc, cmake | Applies a curated list of source mutants (boundary flips, guard inversions, off-by-one) to a scratch copy, runs the fast test subset against each, and reports the kill rate. A mutant that survives means a coverage gap. |
 | `page_cache_env_check.sh` | gcc | Builds a tiny probe that verifies the `FASTALLOC_PAGE_CACHE_MB` and `FASTALLOC_LOG_LEVEL` environment tunables actually change runtime behaviour. |

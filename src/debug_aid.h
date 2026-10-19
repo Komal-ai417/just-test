@@ -34,12 +34,15 @@ enum class LogLevel : int {
 #if FASTALLOC_LOGGING_ENABLED
 // Compiled-in logging. Runtime level defaults from FASTALLOC_LOG_LEVEL env
 // variable (0..5), else Off for release / Warning for debug builds.
-// Thread-safe: single stderr sink, mutex-guarded.
-void LogEvent(LogLevel level, const char* event, const char* fmt, ...);
+// Thread-safe: single stderr sink, mutex-guarded. The printf-style variadic
+// interface is deliberate; format/argument agreement is enforced at compile
+// time by the FASTALLOC_FORMAT_PRINTF attribute.
+FASTALLOC_FORMAT_PRINTF(3, 4)
+void LogEvent(LogLevel level, const char* event, const char* fmt, ...); // NOLINT(cert-dcl50-cpp)
 void LogSetLevel(LogLevel level);
 LogLevel LogGetLevel();
 #else
-inline void LogEvent(LogLevel, const char*, const char* ...) {}
+inline void LogEvent(LogLevel, const char*, const char* ...) {} // NOLINT(cert-dcl50-cpp)
 inline void LogSetLevel(LogLevel) {}
 inline LogLevel LogGetLevel() { return LogLevel::Off; }
 #endif

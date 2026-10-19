@@ -46,12 +46,12 @@ inline void ReportCorruptClassIndex(void* ptr, std::uint32_t class_index) {
     // Atomic one-shot reporting to avoid duplicate logs across threads.
     static std::atomic<bool> reported{false};
     if (!reported.exchange(true, std::memory_order_relaxed)) {
-        std::fprintf(stderr,
+        (void)std::fprintf(stderr,
                      "[fastalloc-invariant] corrupt block header at %p: "
                      "class_index=%u >= %zu; block dropped (leaked), allocator "
                      "state protected\n",
                      ptr, class_index, NUM_SIZE_CLASSES);
-        std::fflush(stderr);
+        (void)std::fflush(stderr);
     }
 }
 #endif // !FASTALLOC_DEBUG_ENABLED
@@ -67,12 +67,12 @@ inline bool LargeHeaderSizePlausible(std::size_t alloc_size) {
 inline void ReportCorruptLargeHeader(void* ptr, std::size_t alloc_size) {
     static std::atomic<bool> reported{false};
     if (!reported.exchange(true, std::memory_order_relaxed)) {
-        std::fprintf(stderr,
+        (void)std::fprintf(stderr,
                      "[fastalloc-invariant] corrupt large header at %p: "
                      "alloc_size=%#zx (not a page-rounded span). Pointer "
                      "dropped (leaked), large cache NOT poisoned.\n",
                      ptr, alloc_size);
-        std::fflush(stderr);
+        (void)std::fflush(stderr);
     }
 }
 
@@ -80,12 +80,12 @@ inline void ReportCorruptLargeHeader(void* ptr, std::size_t alloc_size) {
 inline void ReportNonCanonicalFree(void* ptr) {
     static std::atomic<bool> reported{false};
     if (!reported.exchange(true, std::memory_order_relaxed)) {
-        std::fprintf(stderr,
+        (void)std::fprintf(stderr,
                      "[fastalloc-invariant] free of non-plausible pointer %p "
                      "(fails <64KB / <2^47 / 16-aligned; never a FastAlloc "
                      "block). Pointer dropped, allocator state protected.\n",
                      ptr);
-        std::fflush(stderr);
+        (void)std::fflush(stderr);
     }
 }
 
@@ -93,12 +93,12 @@ inline void ReportNonCanonicalFree(void* ptr) {
 inline void ReportWildReturnValue(void* ptr) {
     static std::atomic<bool> reported{false};
     if (!reported.exchange(true, std::memory_order_relaxed)) {
-        std::fprintf(stderr,
+        (void)std::fprintf(stderr,
                      "[fastalloc-invariant] refusing to return non-plausible "
                      "pointer %p from fast_malloc (leaked, nullptr returned "
                      "instead).\n",
                      ptr);
-        std::fflush(stderr);
+        (void)std::fflush(stderr);
     }
 }
 
@@ -840,27 +840,27 @@ void fast_alloc_purge_thread_cache() {
 
 void fast_alloc_audit_pointers(const void* lo, const void* hi) {
     if (!lo || !hi || lo >= hi) return;
-    std::fprintf(stderr,
+    (void)std::fprintf(stderr,
                  "[fastalloc-audit] scanning allocator head arrays for pointers "
                  "into [%p, %p)\n",
                  const_cast<void*>(lo), const_cast<void*>(hi));
-    std::fflush(stderr);
+    (void)std::fflush(stderr);
     // Forensic reads only (fixed head arrays, no foreign dereferences):
     // safe while the allocator is in any state. See fast_alloc.h.
     std::size_t hits = AuditCurrentThreadCache(lo, hi);
     hits += GlobalHeap::GetInstance().AuditPointers(lo, hi);
     if (hits == 0) {
-        std::fprintf(stderr,
+        (void)std::fprintf(stderr,
                      "[fastalloc-audit] no allocator head pointer targets the "
                      "region (writer held its pointer only transiently, e.g. "
                      "register/stack, or the corrupted link is mid-list)\n");
     } else {
-        std::fprintf(stderr,
+        (void)std::fprintf(stderr,
                      "[fastalloc-audit] %zu pointer(s) target the region - "
                      "the listed structure(s) are the corruption carriers\n",
                      hits);
     }
-    std::fflush(stderr);
+    (void)std::fflush(stderr);
 }
 
 void fast_alloc_log_set_level(int level) {

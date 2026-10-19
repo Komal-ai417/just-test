@@ -111,8 +111,10 @@ if command -v gcovr > /dev/null 2>&1; then
     {
         CMAKE_BUILD_TYPE=Debug configure "$BUILD_ROOT/cov" \
             -DFASTALLOC_COVERAGE=ON -DFASTALLOC_BUILD_BENCHMARKS=OFF
+        # All three ctest-registered binaries (the coverage target runs the
+        # full suite incl. fast_alloc_msan_harness).
         cmake --build "$BUILD_ROOT/cov" -j"$(nproc)" --target \
-            fast_alloc_tests fast_alloc_audit_tests > /dev/null
+            fast_alloc_tests fast_alloc_audit_tests fast_alloc_msan_harness > /dev/null
         cmake --build "$BUILD_ROOT/cov" --target coverage || true
         echo "(coverage report above; HTML/CSV via gcovr flags if needed)"
     } || fail

@@ -15,16 +15,31 @@
 #include <cstdlib>
 #include <vector>
 
+#ifdef _WIN32
+#include <malloc.h>
+#endif
+
 using namespace FastAlloc;
 
 namespace {
 // Page-aligned raw buffer for slab experiments.
 struct RawSpan {
     explicit RawSpan(std::size_t bytes) : size_(bytes) {
+#ifdef _WIN32
+        // MSVC has no posix_memalign; _aligned_malloc/_aligned_free pair up.
+        mem_ = _aligned_malloc(bytes ? bytes : 1, 4096);
+#else
         int rc = posix_memalign(&mem_, 4096, bytes);
         if (rc != 0) mem_ = nullptr;
+#endif
     }
-    ~RawSpan() { std::free(mem_); }
+    ~RawSpan() {
+#ifdef _WIN32
+        _aligned_free(mem_);
+#else
+        std::free(mem_);
+#endif
+    }
     RawSpan(const RawSpan&) = delete;
     RawSpan& operator=(const RawSpan&) = delete;
     void* mem_ = nullptr;

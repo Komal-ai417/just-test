@@ -208,20 +208,35 @@ TEST(MpscPending, PurgeDrainsDeferredBlocksAndReleasesSpans) {
     // the drained slabs can empty and their spans return to the OS. The
     // observable is the OS-free counter: slab-empty releases are counted
     // exactly when the drain processes the deferred blocks.
-    FastAllocTestPurgePageCache();  // clear page-bin residue from prior tests
+    //
+    // State normalization + sizing rationale:
+    //   * Earlier suites leave freed blocks of this class parked in the
+    //     MAIN thread's TLS bin (SizeClassTest walks every class); those
+    //     are invisible to fast_alloc_purge() and keep their slab
+    //     non-empty. Flushing the calling thread's cache first parks them
+    //     where the purge can drain them.
+    //   * In FASTALLOC_OVERRIDE_NEW builds the WHOLE process (gtest's own
+    //     startup allocations included) routes through FastAlloc, so a
+    //     foreign LIVE block of this class can permanently occupy one slab.
+    //     The donor therefore takes 300 blocks - class 214 slabs hold 128
+    //     blocks each, so the donor's blocks are guaranteed to span at
+    //     least three slabs; every slab that contains only donor blocks
+    //     empties on purge and releases its span, no matter what the first
+    //     slab carries.
+    fast_alloc_purge_thread_cache();
+    fast_alloc_purge();
     FastAllocStats t0 = fast_alloc_stats();
-    const std::size_t size = 3421;  // class 214: unique to this test
+    const std::size_t size = 3421;  // class 214: rarely used outside this test
+    constexpr int kBlocks = 300;    // spans >= 3 slabs of 128 blocks
     std::thread donor([&] {
         std::vector<void*> v;
-        // 48 = exactly two refill batches (16 + 32): no bin leftovers, so
-        // every freed block is deferred (bin count 48 <= defer threshold).
-        for (int i = 0; i < 48; ++i) {
+        for (int i = 0; i < kBlocks; ++i) {
             void* p = fast_malloc(size);
             if (p) v.push_back(p);
         }
-        for (void* p : v) fast_free(p);
+        for (void* p : v) fast_free(p);  // bin count > defer cap: bulk flush
     });
-    donor.join();          // bin deferred to the pending queue
+    donor.join();          // remaining bin deferred to the pending queue
     fast_alloc_purge();    // MUST drain pending -> slabs empty -> spans freed
     FastAllocStats t1 = fast_alloc_stats();
     EXPECT_GT(t1.os_free_calls, t0.os_free_calls)

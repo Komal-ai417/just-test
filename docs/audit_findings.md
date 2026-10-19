@@ -214,3 +214,137 @@ separator, unterminated sed) which are fixed with a sed-verification guard.
 | Environment tunables (`FASTALLOC_PAGE_CACHE_MB`, `FASTALLOC_LOG_LEVEL`) | OK (both directions) |
 | Cross-allocator smoke (glibc / jemalloc / FastAlloc, checksummed) | OK |
 | Mutation campaign | 10/10 killed |
+
+---
+
+# Round 2 — CI hardening findings (October 2026, second pass)
+
+The first pass was verified in a GCC-only sandbox; running the delivered
+state on GitHub Actions surfaced eight failing jobs. Root causes and
+resolutions below. Every fix is verified locally this time: the pass added
+a clang 19.1.7 toolchain to the sandbox, so clang-tidy and MemorySanitizer
+gates are now exercised exactly as CI runs them.
+
+## F-11 (High, build system) — Coverage instrumentation never reached any target
+
+`add_compile_options(--coverage ...)` sat in a block at the *bottom* of
+`CMakeLists.txt`, after `add_library(fast_alloc)` and every test target.
+CMake applies directory-scope compile options only to targets created
+**after** the call, so no file was instrumented and gcovr reported 0.0%.
+The flags now live at the top of the file, before any target; a fresh
+`-DFASTALLOC_COVERAGE=ON` build produces .gcda for the library and both
+suites (measured: 77.3% lines / 82.5% functions / 62.0% branches over
+src/ + include/, gate 70%). LTO is now also disabled under coverage
+(gcda handoff through LTO objects is unreliable).
+
+## F-12 (High, CI) — gcovr invocation used flags removed in gcovr 7/8
+
+The CI coverage step and the CMake `coverage` target invoked
+`gcovr --object-directory ... --txt -s --branches ...`. gcovr 7 removed
+`--branches` (branch data became part of the default report) and gcovr 8
+demoted `--object-directory` to a deprecated alias; modern gcovr exits
+non-zero on `--branches`. Both invocations now route through the new
+`tools/coverage_report.sh` (verified against gcovr 5-8), and the CI job
+pins `gcovr==8.7` so the flag set cannot drift with future releases.
+
+## F-13 (High, MSVC portability) — three test/bench files used POSIX-only APIs in unguarded code
+
+- `tests/test_audit_scan.cpp`: the `StderrCapture` helper (dup/dup2/
+  fdopen/getpid + assignment to `stderr`) lived *outside* the file's
+  `#ifndef _WIN32` guard, so MSVC parsed POSIX-only code — C4996 (treated
+  as error under /W4 /WX) plus C2106 because MSVC's `stderr` macro is not
+  an assignable l-value. The capture is now portable: `freopen()` re-binds
+  the same FILE object (valid `stderr` expression on every CRT), the
+  descriptor saved by `_dup`/`dup` is restored with `_dup2`/`dup2`, and
+  the capture file lives under `testing::TempDir()`. The five AuditScan
+  tests now run on Windows too (previously skipped).
+- `tests/test_slab_unit.cpp`: `posix_memalign` → `_aligned_malloc`/
+  `_aligned_free` on MSVC.
+- `benchmarks/bench_audit.cpp`: the system-allocator twin used
+  `std::aligned_alloc`, which the MSVC STL does not provide; it now maps
+  to `_aligned_malloc` on Windows (with a matching `aligned_free`, since
+  the result cannot go through `free`), and the POSIX path rounds the
+  size up to a multiple of the alignment as C11 requires.
+
+## F-14 (Medium, test bug) — MpscPending purge test depended on foreign allocator state
+
+`MpscPending.PurgeDrainsDeferredBlocksAndReleasesSpans` asserted that
+`fast_alloc_purge()` releases the deferred blocks' slab spans, observed
+via `os_free_calls`. Two uncontrolled state sources broke it:
+1. Earlier suites leave freed blocks of the class parked in the *main
+   thread's* TLS bin; `fast_alloc_purge()` cannot flush another
+   structure's bins, so the slab could never empty. The test now
+   normalizes state first (`fast_alloc_purge_thread_cache()` +
+   `fast_alloc_purge()`).
+2. In `FASTALLOC_OVERRIDE_NEW` builds the whole process — gtest's own
+   startup allocations included — routes through FastAlloc, so a foreign
+   *live* block of the class can permanently occupy one slab. The donor
+   now takes 300 blocks (three class-214 slabs of 128), guaranteeing at
+   least two all-donor slabs that provably empty and release on purge.
+   Verified: 20x release + 10x debug + 10x override loops, all green.
+
+## F-15 (Medium, code) — clang-tidy fatal findings never exercised locally
+
+The round-1 `.clang-tidy` policy set `WarningsAsErrors:
+'bugprone-*,cert-*,clang-analyzer-*,concurrency-*'` but the sandbox had
+no clang-tidy, so the fatal surface was never run. With clang-tidy 19
+the following real violations surfaced (all fixed):
+- `bugprone-implicit-widening-of-multiplication-result` — int-products
+  widened to `std::size_t` at `tls_cache.h` (runtime) and in constexpr
+  constants in `global_heap.cpp` / `os_memory.cpp` (constexpr is *not*
+  exempt from the check).
+- `cert-err33-c` — 30+ discarded `fprintf`/`fflush`/`atexit`/`vsnprintf`
+  returns across the diagnostic/reporting paths; all now cast to
+  `(void)` (the CERT-sanctioned form).
+- `cert-err34-c` — `atoi`/`atol` for env-var parsing (no error
+  reporting); both parse sites use `strtol` with end-pointer validation.
+- `clang-analyzer-deadcode.DeadStores` — the defensive `"unknown"`
+  initializer in the violation reporter (provably dead under an
+  exhaustive switch); restructured into a `ViolationKindName()` lookup
+  with a trailing return.
+- `cert-dcl50-cpp` — the deliberate printf-style `LogEvent` variadic:
+  suppressed with NOLINT *and* hardened with a new
+  `FASTALLOC_FORMAT_PRINTF(printf) attribute` so gcc/clang now check
+  every format string against its arguments (the Debug/logging build
+  compiles all call sites under -Werror).
+- `concurrency-mt-unsafe` — `getenv` in `fast_getenv`: NOLINT with the
+  documented rationale (read-only, no environment mutation anywhere).
+- `bugprone-easily-swappable-parameters` — **disabled** in `.clang-tidy`:
+  it flags every natural same-type pair this API surface is built on
+  (range bounds lo/hi, size/capacity, arena/class indices); the check is
+  disabled-by-default upstream for exactly this noise level.
+
+## F-16 (High, test infra) — MSan script compiled gtest sources without gtest
+
+`tools/msan_check.sh` invoked raw `clang++` over the gtest test files;
+googletest only exists via CMake FetchContent, so every TU failed with
+`'gtest/gtest.h' file not found`. MSan additionally requires every
+linked library instrumented — gtest and libstdc++ are not, so a full
+gtest binary can never be a reliable MSan gate. The script now builds
+the new `tests/msan_harness.cpp` (gtest-free, STL-container-free,
+stdio+pthreads only — fully intercepted) through CMake with
+`-DFASTALLOC_SANITIZE=memory` plus origin tracking, and runs it as the
+gate. The harness covers every public API entry point: size-class
+boundaries, calloc-read-before-write (catches "mmap is already zero"
+shortcuts), realloc chains across the small/large boundary, aligned
+allocations, free_sized hints, cross-thread pending hand-off, stats and
+purge. Verified clean locally under clang 19 with
+`-fsanitize-memory-track-origins=2`.
+
+## F-17 (Medium, CI) — ctest ran tests the job never built
+
+- `override-new` builds only the validate + override binaries but ran
+  full ctest; the audit suite (not built: its differential tests are
+  meaningless when the global new/delete override replaces the system
+  allocator) reported "Not Run" and failed the job. The step now uses
+  `-R "fast_alloc_validate_tests|fast_alloc_override_new_tests"`.
+- The new `fast_alloc_msan_harness` ctest entry is registered in every
+  configuration, so every job that builds partial targets and runs
+  ctest (windows-asan, windows-va-emulation, coverage,
+  run_all_verification.sh) now includes the harness in its build list.
+
+## F-18 (Low, robustness) — `default:` missing in an exhaustive enum switch
+
+Covered under F-15's DeadStores fix: `ViolationKindName()` keeps a
+trailing `"unknown"` return so violation kinds added later degrade to a
+readable message instead of undefined behavior.

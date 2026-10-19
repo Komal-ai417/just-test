@@ -61,10 +61,13 @@ unsigned long CurrentTid() {
 int InitialLogLevel() {
     const char* env = fast_getenv("FASTALLOC_LOG_LEVEL");
     if (env && *env) {
-        int v = std::atoi(env);
-        if (v < 0) v = 0;
-        if (v > 5) v = 5;
-        return v;
+        char* end = nullptr;
+        long v = std::strtol(env, &end, 10);
+        if (end != env) {
+            if (v < 0) v = 0;
+            if (v > 5) v = 5;
+            return static_cast<int>(v);
+        }
     }
 #if FASTALLOC_DEBUG_ENABLED
     return static_cast<int>(LogLevel::Warning);
@@ -82,7 +85,8 @@ LogLevel LogGetLevel() {
     return static_cast<LogLevel>(v);
 }
 
-void LogEvent(LogLevel level, const char* event, const char* fmt, ...) {
+FASTALLOC_FORMAT_PRINTF(3, 4)
+void LogEvent(LogLevel level, const char* event, const char* fmt, ...) { // NOLINT(cert-dcl50-cpp)
     int current = g_log_level.load(std::memory_order_relaxed);
     if (current < 0) {
         current = InitialLogLevel();
@@ -93,7 +97,7 @@ void LogEvent(LogLevel level, const char* event, const char* fmt, ...) {
     char body[512];
     va_list ap;
     va_start(ap, fmt);
-    std::vsnprintf(body, sizeof(body), fmt, ap);
+    (void)std::vsnprintf(body, sizeof(body), fmt, ap);
     va_end(ap);
 
     static const char* kNames[6] = { "OFF", "ERROR", "WARN ", "INFO ", "DEBUG", "TRACE" };
@@ -103,7 +107,7 @@ void LogEvent(LogLevel level, const char* event, const char* fmt, ...) {
     unsigned long tid = CurrentTid();
 
     std::lock_guard<std::mutex> lock(g_log_mutex);
-    std::fprintf(stderr, "[FastAlloc][%s][tid=%lu][%s] %s\n",
+    (void)std::fprintf(stderr, "[FastAlloc][%s][tid=%lu][%s] %s\n",
                  kNames[idx], tid, event, body);
 }
 
@@ -335,7 +339,7 @@ std::size_t AllocRegistry::live_bytes() const {
 }
 
 void AllocRegistry::DumpLeaks() {
-    std::fprintf(stderr, "\n================ FastAlloc LEAK REPORT ================\n");
+    (void)std::fprintf(stderr, "\n================ FastAlloc LEAK REPORT ================\n");
     std::size_t total = 0, total_bytes = 0;
     for (std::size_t si = 0; si < kShardCount; ++si) {
         Shard& s = const_cast<Shard&>(shards_[si]);
@@ -344,7 +348,7 @@ void AllocRegistry::DumpLeaks() {
             if (!s.table[i].ptr || IsTombstone(s.table[i].ptr)) continue;
             ++total;
             total_bytes += s.table[i].size;
-            std::fprintf(stderr,
+            (void)std::fprintf(stderr,
                 "  LEAK ptr=%p size=%zu (usable=%zu) class=%s seq=%zu tid=%llu\n",
                 s.table[i].ptr, s.table[i].size, s.table[i].usable,
                 s.table[i].class_or_large == 0xFFFFFFFFu ? "LARGE" : "small",
@@ -353,11 +357,11 @@ void AllocRegistry::DumpLeaks() {
         }
     }
     if (total == 0) {
-        std::fprintf(stderr, "  No live allocations. All blocks freed. No leaks.\n");
+        (void)std::fprintf(stderr, "  No live allocations. All blocks freed. No leaks.\n");
     } else {
-        std::fprintf(stderr, "  TOTAL: %zu live allocations, %zu bytes\n", total, total_bytes);
+        (void)std::fprintf(stderr, "  TOTAL: %zu live allocations, %zu bytes\n", total, total_bytes);
     }
-    std::fprintf(stderr, "=======================================================\n");
+    (void)std::fprintf(stderr, "=======================================================\n");
 }
 
 void AllocRegistry::ResetForTesting() {
@@ -377,30 +381,35 @@ void AllocRegistry::ResetForTesting() {
 namespace {
 std::atomic<ViolationHandler> g_handler{ nullptr };
 
+// Human-readable name for a violation kind; the trailing return covers
+// enum values added after this switch was written.
+const char* ViolationKindName(Violation kind) {
+    switch (kind) {
+        case Violation::DoubleFree:        return "DOUBLE FREE";
+        case Violation::InvalidFree:       return "INVALID FREE (pointer not from FastAlloc)";
+        case Violation::FrontCanaryBroken: return "BUFFER UNDERFLOW (front canary destroyed)";
+        case Violation::RearCanaryBroken:  return "BUFFER OVERFLOW (rear red zone destroyed)";
+        case Violation::PoisonDisturbed:   return "USE-AFTER-FREE WRITE (freed block modified)";
+        case Violation::BadSlabMagic:      return "CORRUPT SLAB HEADER (bad magic)";
+        case Violation::BadLargeMagic:     return "CORRUPT LARGE HEADER (bad magic)";
+        case Violation::RegistryInconsistency: return "REGISTRY INCONSISTENCY";
+        case Violation::InternalInvariant: return "INTERNAL INVARIANT VIOLATED";
+    }
+    return "unknown";
+}
+
 // Marked [[noreturn]] (it always ends in std::abort()): ReportViolation can
 // then call it unconditionally as its final statement without any code after
 // the call, so no unreachable statement ever exists for MSVC /W4 to flag
 // (see the note inside ReportViolation).
 [[noreturn]] void DefaultViolationHandler(const ViolationInfo& info) {
-    const char* what = "unknown";
-    switch (info.kind) {
-        case Violation::DoubleFree:        what = "DOUBLE FREE"; break;
-        case Violation::InvalidFree:       what = "INVALID FREE (pointer not from FastAlloc)"; break;
-        case Violation::FrontCanaryBroken: what = "BUFFER UNDERFLOW (front canary destroyed)"; break;
-        case Violation::RearCanaryBroken:  what = "BUFFER OVERFLOW (rear red zone destroyed)"; break;
-        case Violation::PoisonDisturbed:   what = "USE-AFTER-FREE WRITE (freed block modified)"; break;
-        case Violation::BadSlabMagic:      what = "CORRUPT SLAB HEADER (bad magic)"; break;
-        case Violation::BadLargeMagic:     what = "CORRUPT LARGE HEADER (bad magic)"; break;
-        case Violation::RegistryInconsistency: what = "REGISTRY INCONSISTENCY"; break;
-        case Violation::InternalInvariant: what = "INTERNAL INVARIANT VIOLATED"; break;
-    }
-    std::fprintf(stderr, "\n*** FastAlloc FATAL: %s ***\n", what);
-    std::fprintf(stderr, "    pointer : %p\n", info.ptr);
-    std::fprintf(stderr, "    size    : %zu\n", info.size);
-    std::fprintf(stderr, "    where   : %s\n", info.where);
-    std::fprintf(stderr, "    caller  : %p\n", info.caller);
+    (void)std::fprintf(stderr, "\n*** FastAlloc FATAL: %s ***\n", ViolationKindName(info.kind));
+    (void)std::fprintf(stderr, "    pointer : %p\n", info.ptr);
+    (void)std::fprintf(stderr, "    size    : %zu\n", info.size);
+    (void)std::fprintf(stderr, "    where   : %s\n", info.where);
+    (void)std::fprintf(stderr, "    caller  : %p\n", info.caller);
     if (info.has_record) {
-        std::fprintf(stderr, "    alloc'd : size=%zu seq=%zu tid=%llu\n",
+        (void)std::fprintf(stderr, "    alloc'd : size=%zu seq=%zu tid=%llu\n",
                      info.record.size, info.record.sequence,
                      static_cast<unsigned long long>(info.record.thread_id));
     }
@@ -408,11 +417,11 @@ std::atomic<ViolationHandler> g_handler{ nullptr };
     void* frames[32];
     int n = backtrace(frames, 32);
     if (n > 0) {
-        std::fprintf(stderr, "    backtrace:\n");
+        (void)std::fprintf(stderr, "    backtrace:\n");
         backtrace_symbols_fd(frames, n, 2);
     }
 #endif
-    std::fflush(stderr);
+    (void)std::fflush(stderr);
     std::abort();
 }
 } // namespace
@@ -479,7 +488,7 @@ void FastDumpLeaksImpl() {
 #if FASTALLOC_DEBUG_ENABLED
     AllocRegistry::GetInstance().DumpLeaks();
 #else
-    std::fprintf(stderr,
+    (void)std::fprintf(stderr,
         "[FastAlloc] leak dump requested but FASTALLOC_DEBUG is not enabled;\n"
         "[FastAlloc] rebuild with -DFASTALLOC_DEBUG for exact leak tracking.\n");
 #endif

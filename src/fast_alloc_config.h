@@ -65,11 +65,24 @@ inline const char* fast_getenv(const char* name) {
 #pragma warning(push)
 #pragma warning(disable : 4996)
 #endif
-    return std::getenv(name);
+    // Read-only lookup: FastAlloc never mutates the environment, so there
+    // is no concurrent setenv/putenv writer for this call to race with
+    // (the POSIX caveat that makes getenv mt-unsafe).
+    return std::getenv(name); // NOLINT(concurrency-mt-unsafe)
 #if defined(_MSC_VER)
 #pragma warning(pop)
 #endif
 }
+
+// Compile-time printf format/argument checking for logging-style variadic
+// APIs (GNU-compatible compilers; plain no-op under MSVC, whose CRT format
+// checking is handled by /analyze and SAL annotations instead).
+#if defined(__GNUC__)
+#define FASTALLOC_FORMAT_PRINTF(fmt_arg, var_start) \
+    __attribute__((format(printf, fmt_arg, var_start)))
+#else
+#define FASTALLOC_FORMAT_PRINTF(fmt_arg, var_start)
+#endif
 
 // ============================================================================
 // Debug instrumentation framework

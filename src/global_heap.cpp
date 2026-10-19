@@ -26,15 +26,18 @@ namespace {
 //     enforced across bins, not just within one bin
 // ===========================================================================
 constexpr std::size_t MAX_CACHED_PAGES = 512; // up to 2MB spans
-constexpr std::size_t PAGE_CACHE_PER_BIN_BYTES = 2 * 1024 * 1024;
+constexpr std::size_t PAGE_CACHE_PER_BIN_BYTES = std::size_t{2} * 1024 * 1024;
+// Upper bound for a single slab span (matches the page-cache span cap).
+constexpr std::size_t MAX_SLAB_SPAN_BYTES = std::size_t{2} * 1024 * 1024;
 
 std::size_t PageCacheTotalLimit() {
     static const std::size_t limit = []() {
         const char* env = fast_getenv("FASTALLOC_PAGE_CACHE_MB");
         std::size_t mb = 64;
         if (env && *env) {
-            long v = std::atol(env);
-            if (v > 0) mb = static_cast<std::size_t>(v);
+            char* end = nullptr;
+            long v = std::strtol(env, &end, 10);
+            if (end != env && v > 0) mb = static_cast<std::size_t>(v);
         }
         return mb * 1024 * 1024;
     }();
@@ -268,7 +271,7 @@ GlobalHeap& GlobalHeap::GetInstance() {
 GlobalHeap::GlobalHeap() : next_arena_(0) {
     // Mark shutdown at process exit so TLSCache destructors skip
     // reflushing memory into the global heap.
-    std::atexit([]() {
+    (void)std::atexit([]() {
         GlobalHeap::GetInstance().shutting_down_.store(true, std::memory_order_release);
     });
 }
@@ -324,7 +327,7 @@ Slab* GlobalHeap::AllocateNewSlab(std::size_t class_index, uint32_t arena_index)
 
     std::size_t target_size = block_size * target_blocks;
     if (target_size < 65536) target_size = 65536;
-    if (target_size > 2 * 1024 * 1024) target_size = 2 * 1024 * 1024;
+    if (target_size > MAX_SLAB_SPAN_BYTES) target_size = MAX_SLAB_SPAN_BYTES;
 
     std::size_t page_size = OSMemory::GetPageSize();
     std::size_t memory_size = (target_size + page_size - 1) & ~(page_size - 1);
@@ -858,7 +861,7 @@ std::size_t GlobalHeap::AuditPointers(const void* lo, const void* hi) {
             const Slab* partial = arena.partial_slabs_[c];
             if (reinterpret_cast<std::uintptr_t>(partial) >= low &&
                 reinterpret_cast<std::uintptr_t>(partial) < high) {
-                std::fprintf(stderr,
+                (void)std::fprintf(stderr,
                              "[fastalloc-audit] arena %u class %zu partial_slabs head=%p -> IN RANGE\n",
                              a, c,
                              const_cast<void*>(static_cast<const void*>(partial)));
@@ -867,7 +870,7 @@ std::size_t GlobalHeap::AuditPointers(const void* lo, const void* hi) {
             const Slab* full = arena.full_slabs_[c];
             if (reinterpret_cast<std::uintptr_t>(full) >= low &&
                 reinterpret_cast<std::uintptr_t>(full) < high) {
-                std::fprintf(stderr,
+                (void)std::fprintf(stderr,
                              "[fastalloc-audit] arena %u class %zu full_slabs head=%p -> IN RANGE\n",
                              a, c,
                              const_cast<void*>(static_cast<const void*>(full)));
@@ -877,7 +880,7 @@ std::size_t GlobalHeap::AuditPointers(const void* lo, const void* hi) {
                 arena.pending_returns_[c].head.load(std::memory_order_relaxed);
             if (reinterpret_cast<std::uintptr_t>(pending) >= low &&
                 reinterpret_cast<std::uintptr_t>(pending) < high) {
-                std::fprintf(stderr,
+                (void)std::fprintf(stderr,
                              "[fastalloc-audit] arena %u class %zu pending head=%p -> IN RANGE\n",
                              a, c, static_cast<void*>(const_cast<FreeBlock*>(pending)));
                 ++hits;
@@ -888,7 +891,7 @@ std::size_t GlobalHeap::AuditPointers(const void* lo, const void* hi) {
         const PageNode* node = page_bins_[p].head;
         if (reinterpret_cast<std::uintptr_t>(node) >= low &&
             reinterpret_cast<std::uintptr_t>(node) < high) {
-            std::fprintf(stderr,
+            (void)std::fprintf(stderr,
                          "[fastalloc-audit] page bin %zu head=%p -> IN RANGE\n",
                          p, static_cast<void*>(const_cast<PageNode*>(node)));
             ++hits;
