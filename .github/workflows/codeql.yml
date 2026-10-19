@@ -1,0 +1,46 @@
+name: CodeQL
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  schedule:
+    - cron: '30 4 * * 3'  # weekly, Wednesday 04:30 UTC
+  workflow_dispatch:
+
+permissions:
+  security-events: write
+  contents: read
+
+jobs:
+  codeql-cpp:
+    name: codeql-cpp-analysis
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: cpp
+          # Security-audit + security-extended query sets surface allocator-
+          # relevant classes (integer overflow, out-of-bounds, use-after-free
+          # patterns, tainted-size handling) beyond the default suite.
+          queries: security-extended,security-and-quality
+
+      - name: Configure (make the compile database visible to CodeQL)
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+                -DFASTALLOC_BUILD_TESTS=ON \
+                -DFASTALLOC_BUILD_BENCHMARKS=OFF
+
+      - name: Build (autobuild picks up the cmake compile commands)
+        uses: github/codeql-action/autobuild@v3
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@v3
+        with:
+          category: '/language:cpp'

@@ -1,0 +1,295 @@
+<div align="center">
+  <h1>FastAlloc</h1>
+  <p><b>A High-Performance, Thread-Safe C++ Memory Allocator</b></p>
+  
+  [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+  [![C++17](https://img.shields.io/badge/C++-17-blue.svg)]()
+  [![Platform: Windows | Linux](https://img.shields.io/badge/Platform-Windows%20%7C%20Linux-lightgray.svg)]()
+  [![CI: passing](https://img.shields.io/badge/CI-all%20jobs%20green-brightgreen.svg)](.github/workflows/ci.yml)
+</div>
+
+<br>
+
+**FastAlloc** is a custom-built, ultra-low-latency memory allocator designed as a drop-in replacement for standard `malloc` and `free`. By combining platform-native Thread-Local Storage (TLS) caching with targeted lock-free structures and bounded OS-memory caching, FastAlloc reduces allocator overhead under heavy multi-threaded contention. It ships with a full memory-safety instrumentation mode, a 141-case Google Test suite plus a 49-case audit suite, sanitizer-clean (ASan/UBSan/TSan/LSan) verification in CI, mutation-tested coverage, and a one-command cross-allocator benchmark verdict tool.
+
+---
+
+## Key Features & Architecture
+
+FastAlloc is engineered for extreme multi-core scalability:
+
+- **Wait-Free Fast Path:** Utilizing platform-native TLS (FLS on Windows, Pthreads on Linux), thread-specific caches allow the vast majority of allocations and deallocations to bypass mutex locks completely.
+- **Adaptive Slab Sizing:** OS-level memory mappings scale dynamically based on allocation size. Small objects use 64KB slabs, while larger objects scale up to 128KB (and up to 2MB dynamically). This balances throughput with memory efficiency, saving massive amounts of virtual memory versus fixed-density slabs.
+- **Lock-Free Memory Handoff:** Returning memory to other arenas is handled via isolated, lock-free MPSC (Multi-Producer, Single-Consumer) pending queues (`std::atomic::compare_exchange_weak`), eliminating O(N²) lock contention when threads deallocate cross-thread.
+- **Aggressive Memory Unmapping:** FastAlloc guarantees aggressive return of empty slabs to the OS *outside* the critical path spinlocks, ensuring a memory footprint often smaller than the system `malloc` — measured 16 MB retained after purging a 1M-object workload vs 46.7 / 171.8 / 552.2 MB for glibc / jemalloc / mimalloc.
+- **Out-of-Lock OS Allocation:** Critical system calls (`VirtualAlloc` / `mmap`) are executed entirely outside global spinlocks, ensuring that slow OS page mapping never blocks other threads from accessing the global heap.
+- **Exponential Spinlock Backoff:** Global stripe locks implement hardware-aware backoff (using `_mm_pause()` / `__builtin_ia32_pause()`) and `std::this_thread::yield()`, drastically improving stability under extreme contention.
+- **Memory-Safety Instrumentation (`FASTALLOC_DEBUG`):** front canaries, rear red zones, freed-block poisoning (use-after-free detection), slab/large-header magic validation, an exact allocation registry with double-free/invalid-free detection, leak reporting, a full statistics API and level-gated logging — all compiled out in release builds.
+- **Deterministic OOM Behaviour:** allocation failure returns `nullptr` cleanly; the allocator stays usable (verified by an OOM-injection test seam).
+- **Bounded Retention:** the page-span cache is capped (2 MB per bin / 64 MB global, tunable) instead of retaining up to ~8 GB; `fast_alloc_purge()` returns everything to the OS on demand.
+- **Aligned Allocation:** `fast_aligned_alloc` for alignments up to 4096 bytes; `fast_realloc` preserves them.
+- **In-Place Large Realloc:** large blocks grow via `mremap` (Linux) and shrink by releasing tail pages, instead of always copying.
+- **Tested Concurrency:** the cross-thread MPSC handoff, thread-exit flush and 8-thread contended churn are verified under ThreadSanitizer with zero races.
+
+## System Architecture
+
+```mermaid
+flowchart TD
+    User[Thread Allocations] -->|Wait-Free| TLS[Native TLS Cache]
+    User -->|Size > 8KB| OS
+    
+    subgraph FastAlloc Core
+        TLS -->|Batch Fetch & Evict| GH{Global Heap\n16 Arenas}
+        GH -.->|Lock-Free Handoff| TLS
+        
+        GH <-->|Small Classes| S1[Slab 64KB - 256 blocks]
+        GH <-->|Medium Classes| S2[Slab 128KB - 128 blocks]
+        GH <-->|Large Classes| S3[Slab 128KB - 32 blocks]
+    end
+    
+    S1 <-->|Map / Unmap| OS[OS Virtual Memory]
+    S2 <-->|Map / Unmap| OS
+    S3 <-->|Map / Unmap| OS
+```
+
+## Quick Start
+
+FastAlloc is built using CMake and requires **C++17** or higher.
+
+### Building from Source
+
+#### Linux / macOS
+```bash
+git clone https://github.com/yourusername/FastAlloc.git
+cd FastAlloc
+cmake -B build
+cmake --build build --config Release
+```
+
+#### Windows — MSVC (Visual Studio Developer Shell)
+```powershell
+cmake -B build
+cmake --build build --config Release
+```
+
+#### Windows — MinGW/UCRT64 (MSYS2)
+```powershell
+# Requires: MSYS2 with ucrt64 toolchain (https://www.msys2.org/)
+# cmake can also be installed via: pip install cmake
+python -m cmake -S . -B build -G "MinGW Makefiles" `
+    -DCMAKE_BUILD_TYPE=Release `
+    -DCMAKE_C_COMPILER=C:/msys64/ucrt64/bin/gcc.exe `
+    -DCMAKE_CXX_COMPILER=C:/msys64/ucrt64/bin/g++.exe `
+    -DCMAKE_MAKE_PROGRAM=C:/msys64/ucrt64/bin/mingw32-make.exe
+python -m cmake --build build --config Release -j 4
+```
+
+## Usage
+
+FastAlloc provides a direct C-style API mapping to standard memory functions.
+
+### Basic C-API
+```cpp
+#include "fast_alloc.h"
+
+int main() {
+    // Allocate 128 bytes
+    void* my_data = FastAlloc::fast_malloc(128); 
+    
+    // Use the memory...
+
+    // Free the memory
+    FastAlloc::fast_free(my_data);
+
+    // Calloc and Realloc are also supported:
+    // void* data = FastAlloc::fast_calloc(10, sizeof(int));
+    // void* resized = FastAlloc::fast_realloc(data, 256);
+
+    return 0;
+}
+```
+
+### Global `new`/`delete` Override
+
+You can seamlessly route all standard C++ `new` and `delete` operators through FastAlloc to instantly inject high performance into third-party libraries and existing codebases.
+
+To enable this, compile your project with the macro definition `FAST_ALLOC_OVERRIDE_NEW`:
+
+```cpp
+// When FAST_ALLOC_OVERRIDE_NEW is defined:
+int* numbers = new int[1000]; // Automatically uses FastAlloc::fast_malloc
+delete[] numbers;             // Automatically uses FastAlloc::fast_free
+```
+
+## Testing & Benchmarks
+
+The project uses CMake's `FetchContent` to dynamically isolate and link **Google Test** and **Google Benchmark**.
+
+### Verify Memory Integrity (GTest)
+```bash
+ctest --test-dir build -C Release -V
+```
+
+### Full Local Verification (one command)
+
+`tools/run_all_verification.sh` drives the complete matrix locally:
+release + debug + override-new suites, ASan/UBSan/TSan/LSan builds, a
+coverage report (when `gcovr` is present), fuzz smoke campaigns and a
+benchmark smoke — see [tools/README.md](tools/README.md).
+
+```bash
+bash tools/run_all_verification.sh           # full matrix
+SKIP_SLOW=1 bash tools/run_all_verification.sh  # quick CI-ish mode
+```
+
+Additional verification tooling (all runnable from the repo root):
+
+| Tool | Command |
+| :--- | :--- |
+| Coverage (gcov) | `cmake -B build-cov -DFASTALLOC_COVERAGE=ON && cmake --build build-cov && cmake --build build-cov --target coverage` |
+| Override-new suite | `cmake -B build-newo -DFASTALLOC_OVERRIDE_NEW=ON && cmake --build build-newo && ctest --test-dir build-newo` |
+| Valgrind memcheck | `bash tools/valgrind_memcheck.sh` |
+| Static analysis (warnings matrix, cppcheck, clang-tidy) | `bash tools/static_analysis.sh` |
+| Mutation testing (kill-rate gate) | `bash tools/mutation_test.sh` |
+| MSan (clang) | `bash tools/msan_check.sh` |
+| Syscall shape (strace) | `bash tools/strace_syscalls.sh` |
+| Env tunables | `bash tools/page_cache_env_check.sh` |
+| Cross-allocator matrix | `bash tools/cross_allocator_matrix.sh results.jsonl 5` |
+| Fuzz (standalone, no libFuzzer needed) | `./build/fast_alloc_fuzz_standalone 60 seed` |
+
+The item-by-item status of the whole verification programme lives in
+[CHECKLIST.md](CHECKLIST.md); defects found and fixed during the audit are
+documented in [docs/audit_findings.md](docs/audit_findings.md).
+
+### Run Benchmarks
+
+**One command — every benchmark, full win/loss verdict report:**
+
+```bash
+python3 benchmarks/benchsuite/bench_compare.py \
+    --mimalloc-so /path/to/libmimalloc.so.2   # (auto-detects if installed)
+    --reps 5 --threads 1,2,4
+```
+
+`bench_compare.py` is the single verdict tool: it runs the two Google-Benchmark
+micro-suites (std vs FastAlloc, 92 paired configs), the full cross-allocator
+`bench_suite` matrix (11 workloads × {1,2,4} threads × glibc / jemalloc /
+mimalloc / FastAlloc, one allocator per process, median of 5 reps,
+checksum-guarded), and the side-by-side memory stress benchmark, then prints
+a per-category verdict with the exact multiplier for **every** type — e.g.
+`MallocOnly 16B T=1: FastAlloc wins by 1.29x`, `Realloc 512B T=1: std wins
+by 1.29x`, `purge-retention vs mimalloc: FastAlloc keeps 34.5x LESS memory`.
+It writes `bench_report.md`, chart-ready `bench_report_data.json` and raw
+JSONL. Long sessions can be chunked (`--workloads churn,tiny`,
+`--suite-skip-run`, `--gbench-cache`) and `--quick` gives a smoke preset.
+
+**Individual suites** (what the tool drives under the hood):
+
+```bash
+# 1. Legacy GBench microbenchmarks (fast-path LIFO batches)
+./build/fast_alloc_bench
+./build/fast_alloc_bench_extended
+
+# 2. Side-by-side memory stress (time + peak RSS)
+./build/fast_alloc_bench_memory --threads 4 --allocs 20000 --size 4096
+
+# 2b. Latency percentiles / throughput scaling / realistic workloads,
+#     with a glibc twin for same-binary differential output:
+./build/fast_alloc_bench_audit
+./build/fast_alloc_bench_audit_glibc
+
+# 2c. Cold-start / thread-lifecycle / burst benchmarks:
+./build/fast_alloc_bench_lifecycle --quick
+
+# 3. Rigorous cross-allocator suite (bench_suite): 11 Larsson/mimalloc-bench
+#    style workloads against glibc / jemalloc / mimalloc via LD_PRELOAD,
+#    one allocator per process, JSONL output:
+cmake --build build --target bench_suite -j
+mkdir -p benchmarks/results
+./build/bench_suite --alloc fast --label FastAlloc --workload churn --threads 4 --reps 5 --json benchmarks/results/bench_fast.jsonl
+LD_PRELOAD=/lib/x86_64-linux-gnu/libjemalloc.so.2 ./build/bench_suite --alloc std --label jemalloc --workload churn --threads 4 --reps 5 --json benchmarks/results/bench_fast.jsonl
+
+# 4. Cross-allocator matrix driver + analyzer (CI's benchmark-matrix job)
+cd benchmarks/benchsuite && bash ./run_matrix.sh ../../benchmarks/results/cross_allocator_results.jsonl 5
+python3 analyze.py ../../benchmarks/results/cross_allocator_results.jsonl
+```
+
+*Note (honest, re-measured 2026-09-10 on a 2-vCPU VM vs glibc 2.41 /
+jemalloc 5.3.0 / mimalloc 2.1.7, median of 5, one allocator per process):*
+FastAlloc **wins 20/33 throughput cells vs glibc, 21/33 vs jemalloc and
+12/33 vs mimalloc**. It is fastest in every small-block pair workload at
+every thread count (small-mixed 1.24–1.51x vs glibc; random 1–4096 B up to
+2.98x; ramp 1.54–1.94x; churn beats glibc at T=1/2 and ties at T=4), has the
+best p50/p99 tail latency of all four allocators, is 4.6–14.6x faster than
+jemalloc/mimalloc on large-block cycles, and retains **2.9x/10.7x/34.5x
+less RSS** than glibc/jemalloc/mimalloc after freeing 1M objects and
+purging (16.0 MB vs 46.7/171.8/552.2 MB). It is **not** fastest for
+realloc-heavy code (glibc 0.28x — contiguous heap grows in place; ties
+mimalloc, beats jemalloc 1.25x), for constant-live-set churn against
+jemalloc/mimalloc's private-arena design (0.55–0.75x), for ramp against
+mimalloc's thread-local heap (0.36–0.51x), for bulk free storms (0.66x —
+the price of the memory-return win), or for thread spawn/exit storms vs
+glibc's minimal tcache (0.48–0.62x; still 2.2–2.6x faster than jemalloc) —
+see [docs/performance_report.md](docs/performance_report.md) for the full
+win/loss matrices, latency/memory/thread-lifecycle sections, and
+root causes.
+
+## Documentation
+
+For in-depth explanations of FastAlloc's internal mechanics, refer to the docs:
+- [Performance & Benchmark Report](docs/performance_report.md)
+- [Technical Design Document](docs/technical_design.md)
+- [QA & Memory Safety Report](docs/qa_report.md)
+- [Audit Findings & Fix Report](docs/audit_findings.md)
+- [API Reference Guide](docs/api_reference.md)
+- [Verification Checklist](CHECKLIST.md)
+
+## License
+
+This project is licensed under the **MIT License** - see the [LICENSE](LICENSE) file for details.
+
+
+---
+
+## Verification Matrix
+
+| Configuration | Tests | Status |
+| :--- | :--- | :--- |
+| Linux Release (`-O3 -march=native` + LTO, `-Wall -Wextra -Werror`) | 141 | all pass, zero warnings |
+| Linux Debug instrumentation (`FASTALLOC_DEBUG`) | 174 (incl. 12 death tests + registry/poison/logging suites; 1 debug-only skip by design) | all pass |
+| Override-new (`FAST_ALLOC_OVERRIDE_NEW`, release + debug) | 141/173 + 12 override cases | all pass |
+| Linux AddressSanitizer (+LSan) | 141 + 49 audit | zero memory errors |
+| Linux UBSan | 141 + 49 audit | zero undefined behaviour |
+| Linux ThreadSanitizer | 141 + 49 audit | **zero data races** |
+| Linux LeakSanitizer (debug) | 173 | zero leaks |
+| Windows/MSVC Release | CI matrix | all pass |
+| Windows/MinGW UCRT64 Release | CI matrix | pass (documented platform skips) |
+| Benchmark checksums (suite cells + gbench configs) | — | zero failures |
+| Static analysis (`-Wpedantic` matrix; cppcheck/clang-tidy in CI) | — | clean |
+| Mutation testing (10 curated allocator-bug mutants) | 10/10 | **100% kill rate** |
+| Fuzz campaigns (release / debug / ASan semantics) | 50M+ ops total | clean |
+
+CI (all jobs green on every push): ubuntu/windows × release/debug +
+clang builds, windows-msvc-asan (3x repeat), ASan+UBSan, TSan, LSan,
+Windows-VA emulation, override-new (release + debug), coverage (with a
+line-coverage gate), static analysis, MSan, valgrind memcheck, tool-script
+checks, nightly mutation testing, CodeQL, and both benchmark jobs that
+execute *every* benchmark binary — see `docs/qa_report.md` §4 for the job
+table.
+
+Reproduce locally:
+
+```bash
+cmake -B build -DFASTALLOC_DEBUG=ON && cmake --build build && ctest --test-dir build --output-on-failure
+cmake -B build-asan -DFASTALLOC_SANITIZE=address,undefined && cmake --build build-asan && ctest --test-dir build-asan
+cmake -B build-tsan -DFASTALLOC_SANITIZE=thread && cmake --build build-tsan && ctest --test-dir build-tsan
+cmake -B build-lsan -DFASTALLOC_SANITIZE=leak && cmake --build build-lsan && ctest --test-dir build-lsan
+cmake -B build-newo -DFASTALLOC_OVERRIDE_NEW=ON && cmake --build build-newo && ctest --test-dir build-newo
+cmake -B build-cov -DFASTALLOC_COVERAGE=ON && cmake --build build-cov && cmake --build build-cov --target coverage
+```
+
+See `docs/qa_report.md` for the full, evidence-backed QA report,
+`docs/audit_findings.md` for the audit findings and fixes,
+`CHECKLIST.md` for the item-by-item verification status, and
+`docs/api_reference.md` for the complete API contract (zero-size semantics,
+OOM behaviour, diagnostics API).

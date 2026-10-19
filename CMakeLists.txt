@@ -1,0 +1,343 @@
+cmake_minimum_required(VERSION 3.15)
+project(FastAlloc VERSION 2.0.0 LANGUAGES CXX)
+
+# Enforce C++17 or higher
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED True)
+
+# Project options
+option(FASTALLOC_BUILD_TESTS "Build unit tests" ON)
+option(FASTALLOC_BUILD_BENCHMARKS "Build performance benchmarks" ON)
+option(FASTALLOC_BUILD_FUZZ "Build entropy-driven fuzz harnesses (standalone; no libFuzzer dependency)" OFF)
+option(FASTALLOC_OVERRIDE_NEW "Override standard new/delete operators" OFF)
+option(FASTALLOC_DEBUG "Enable debug instrumentation (canaries, red zones, poison, registry, leak dump)" OFF)
+option(FASTALLOC_SANITIZE "Sanitizer preset: address|thread|leak|undefined|address,undefined (empty = off)" "")
+option(FASTALLOC_COVERAGE "Build with gcov instrumentation and add the coverage report target (gcc only)" OFF)
+
+# ---------------------------------------------------------------------------
+# Threads (the library itself uses pthreads on POSIX: pthread_key_create etc.)
+# ---------------------------------------------------------------------------
+set(THREADS_PREFER_PTHREAD_FLAG ON)
+find_package(Threads REQUIRED)
+
+# ---------------------------------------------------------------------------
+# Debug instrumentation
+# ---------------------------------------------------------------------------
+if(FASTALLOC_DEBUG)
+    add_definitions(-DFASTALLOC_DEBUG)
+endif()
+
+# ---------------------------------------------------------------------------
+# Sanitizers
+# ---------------------------------------------------------------------------
+if(FASTALLOC_SANITIZE AND NOT MSVC)
+    # LTO is incompatible with sanitizers in many toolchains; disable it.
+    set(FASTALLOC_SANITIZE_LTO OFF)
+    add_compile_options(-fsanitize=${FASTALLOC_SANITIZE} -fno-omit-frame-pointer -g)
+    add_link_options(-fsanitize=${FASTALLOC_SANITIZE})
+elseif(FASTALLOC_SANITIZE AND MSVC)
+    add_compile_options(/fsanitize=address /Zi)
+    add_link_options(/INCREMENTAL:NO /DEBUG)
+endif()
+
+# ---------------------------------------------------------------------------
+# MSVC ASan runtime staging
+#
+# /fsanitize=address + dynamic CRT (/MD) requires clang_rt.asan_dynamic-x86_64.dll
+# at runtime. The DLL resides within the MSVC toolset directory. Copying the DLL
+# next to each executable makes the test executables self-contained and runnable
+# regardless of whether the MSVC toolset directory is on the system PATH.
+# ---------------------------------------------------------------------------
+set(FASTALLOC_ASAN_DLL "")
+if(MSVC AND FASTALLOC_SANITIZE)
+    get_filename_component(FASTALLOC_MSVC_BIN_DIR "${CMAKE_CXX_COMPILER}" DIRECTORY)
+    set(FASTALLOC_ASAN_DLL_CANDIDATE
+        "${FASTALLOC_MSVC_BIN_DIR}/clang_rt.asan_dynamic-x86_64.dll")
+    if(EXISTS "${FASTALLOC_ASAN_DLL_CANDIDATE}")
+        set(FASTALLOC_ASAN_DLL "${FASTALLOC_ASAN_DLL_CANDIDATE}")
+    else()
+        message(STATUS "FastAlloc: clang_rt.asan_dynamic-x86_64.dll not "
+                       "found at ${FASTALLOC_ASAN_DLL_CANDIDATE} - runtime "
+                       "staging skipped (the CI job stages it / PATH)")
+    endif()
+endif()
+
+# Copies the ASan runtime DLL into the target's output directory when
+# building with MSVC + sanitizers; a no-op everywhere else (including the
+# static-runtime / cross-compile cases, where the import does not exist).
+macro(fastalloc_stage_asan_runtime target)
+    if(FASTALLOC_ASAN_DLL)
+        add_custom_command(TARGET ${target} POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                    "${FASTALLOC_ASAN_DLL}" $<TARGET_FILE_DIR:${target}>
+            COMMENT "Staging clang_rt.asan_dynamic-x86_64.dll for ${target}")
+    endif()
+endmacro()
+
+# Compiler-specific optimizations
+if(MSVC)
+    # fopen/fscanf/getenv trigger C4996 deprecation on MSVC; under /W4 /WX
+    # they become hard errors, so silence the CRT deprecation noise globally.
+    add_definitions(-D_CRT_SECURE_NO_WARNINGS)
+    set(WARNING_FLAGS /W4 /WX)
+    if(NOT FASTALLOC_SANITIZE)
+        add_compile_options("$<$<CONFIG:Release>:/Ot>" "$<$<CONFIG:Release>:/Ox>" "$<$<CONFIG:Release>:/GL>")
+        add_link_options("$<$<CONFIG:Release>:/LTCG>")
+    endif()
+else()
+    # Aggressive optimizations for GCC/Clang
+    set(WARNING_FLAGS -Wall -Wextra -Werror)
+    if(NOT FASTALLOC_SANITIZE)
+        add_compile_options("$<$<CONFIG:Release>:-O3>" "$<$<CONFIG:Release>:-march=native>")
+        # -fno-plt is an ELF-target optimization; PE/COFF (MinGW) targets
+        # should not use it.
+        if(NOT WIN32)
+            add_compile_options("$<$<CONFIG:Release>:-fno-plt>")
+        endif()
+        # Clang >= 19 diagnoses -march=native feature combinations that implicitly
+        # promote (e.g. +avx10.1-256 promoted to avx10.1-512) via -Winvalid-feature-combination.
+        # Demote this diagnostic from an error to a warning when -Werror is enabled.
+        if(CMAKE_CXX_COMPILER_ID MATCHES "Clang" AND
+           CMAKE_CXX_COMPILER_VERSION VERSION_GREATER_EQUAL 19)
+            add_compile_options(-Wno-error=invalid-feature-combination)
+        endif()
+    endif()
+endif()
+
+if(FASTALLOC_OVERRIDE_NEW)
+    add_definitions(-DFAST_ALLOC_OVERRIDE_NEW)
+endif()
+
+# ---------------------------------------------------------------------------
+# Core Library
+# ---------------------------------------------------------------------------
+add_library(fast_alloc STATIC
+    src/fast_alloc.cpp
+    src/slab.cpp
+    src/tls_cache.cpp
+    src/global_heap.cpp
+    src/os_memory.cpp
+    src/debug_aid.cpp
+)
+target_compile_options(fast_alloc PRIVATE ${WARNING_FLAGS})
+target_link_libraries(fast_alloc PUBLIC Threads::Threads)
+
+target_include_directories(fast_alloc PUBLIC include src)
+
+# ---------------------------------------------------------------------------
+# Dependencies (GTest and GBenchmark)
+# ---------------------------------------------------------------------------
+include(FetchContent)
+
+if(FASTALLOC_BUILD_TESTS)
+    FetchContent_Declare(
+        googletest
+        GIT_REPOSITORY https://github.com/google/googletest.git
+        GIT_TAG v1.14.0
+    )
+    set(gtest_force_shared_crt ON CACHE BOOL "" FORCE)
+    FetchContent_MakeAvailable(googletest)
+
+    add_executable(fast_alloc_tests
+        tests/test_main.cpp
+        tests/test_api.cpp
+        tests/test_api_contract.cpp
+        tests/test_size_classes.cpp
+        tests/test_large.cpp
+        tests/test_debug_aids.cpp
+        tests/test_concurrency.cpp
+        tests/test_oom.cpp
+        tests/test_aligned.cpp
+        tests/test_stress.cpp
+        tests/test_new_delete.cpp
+        tests/test_page_cache.cpp
+        tests/test_mpsc_pending.cpp
+        tests/test_realloc_matrix.cpp
+        tests/test_audit_scan.cpp
+        tests/test_slab_unit.cpp
+        tests/test_debug_registry.cpp
+        tests/sanitizer_defaults.cpp
+    )
+    target_compile_options(fast_alloc_tests PRIVATE ${WARNING_FLAGS})
+    target_link_libraries(fast_alloc_tests PRIVATE fast_alloc GTest::gtest_main)
+    fastalloc_stage_asan_runtime(fast_alloc_tests)
+
+    include(CTest)
+    add_test(NAME fast_alloc_validate_tests COMMAND fast_alloc_tests)
+
+    # Audit test suite (49 gtest cases: functional, property, differential,
+    # concurrency, slab/OOM/fragmentation). Requires GTest, so it lives inside
+    # the FASTALLOC_BUILD_TESTS block.
+    add_subdirectory(tests/audit)
+
+    # Focused operator-new override tests. The strict assertions activate only
+    # in builds with FASTALLOC_OVERRIDE_NEW=ON (the whole binary then routes
+    # every allocation through FastAlloc); in default builds the same
+    # expressions run as smoke tests through the standard allocator.
+    add_executable(fast_alloc_override_tests tests/test_new_delete.cpp tests/sanitizer_defaults.cpp)
+    target_compile_options(fast_alloc_override_tests PRIVATE ${WARNING_FLAGS})
+    target_link_libraries(fast_alloc_override_tests PRIVATE fast_alloc GTest::gtest_main)
+    fastalloc_stage_asan_runtime(fast_alloc_override_tests)
+    if(FASTALLOC_OVERRIDE_NEW)
+        add_test(NAME fast_alloc_override_new_tests COMMAND fast_alloc_override_tests)
+    endif()
+
+    # Convenience targets for the common verification matrix
+    add_custom_target(check
+        COMMAND ${CMAKE_CTEST_COMMAND} --output-on-failure
+        DEPENDS fast_alloc_tests fast_alloc_audit_tests
+        COMMENT "Running FastAlloc test suite"
+    )
+endif()
+
+if(FASTALLOC_BUILD_BENCHMARKS)
+    FetchContent_Declare(
+        googlebenchmark
+        GIT_REPOSITORY https://github.com/google/benchmark.git
+        GIT_TAG v1.9.4
+    )
+    set(BENCHMARK_ENABLE_TESTING OFF CACHE BOOL "" FORCE)
+    set(BENCHMARK_ENABLE_WERROR OFF CACHE BOOL "" FORCE)
+    FetchContent_MakeAvailable(googlebenchmark)
+
+    if(TARGET benchmark AND NOT MSVC)
+        target_compile_options(benchmark PRIVATE -Wno-switch)
+    endif()
+
+    add_executable(fast_alloc_bench benchmarks/bench_main.cpp)
+    target_compile_options(fast_alloc_bench PRIVATE ${WARNING_FLAGS})
+    target_link_libraries(fast_alloc_bench PRIVATE fast_alloc benchmark::benchmark)
+    fastalloc_stage_asan_runtime(fast_alloc_bench)
+
+    add_executable(fast_alloc_bench_extended benchmarks/bench_extended.cpp)
+    target_compile_options(fast_alloc_bench_extended PRIVATE ${WARNING_FLAGS})
+    target_link_libraries(fast_alloc_bench_extended PRIVATE fast_alloc benchmark::benchmark)
+    fastalloc_stage_asan_runtime(fast_alloc_bench_extended)
+
+    add_executable(fast_alloc_bench_memory benchmarks/bench_memory.cpp)
+    target_compile_options(fast_alloc_bench_memory PRIVATE ${WARNING_FLAGS})
+    target_link_libraries(fast_alloc_bench_memory PRIVATE fast_alloc)
+    fastalloc_stage_asan_runtime(fast_alloc_bench_memory)
+    if(WIN32)
+        # GetProcessMemoryInfo (psapi.h) resolves to Psapi.lib on some
+        # MinGW/MSVC SDK configurations; harmless when already in kernel32.
+        target_link_libraries(fast_alloc_bench_memory PRIVATE psapi)
+    endif()
+
+    # Latency percentiles / throughput scaling / realistic workloads, with a
+    # glibc twin for side-by-side differential output (same binary, two
+    # compile-time allocator backends).
+    add_executable(fast_alloc_bench_audit benchmarks/bench_audit.cpp)
+    target_compile_options(fast_alloc_bench_audit PRIVATE ${WARNING_FLAGS})
+    target_link_libraries(fast_alloc_bench_audit PRIVATE fast_alloc Threads::Threads)
+    fastalloc_stage_asan_runtime(fast_alloc_bench_audit)
+
+    add_executable(fast_alloc_bench_audit_glibc benchmarks/bench_audit.cpp)
+    target_compile_definitions(fast_alloc_bench_audit_glibc PRIVATE USE_GLIBC)
+    target_compile_options(fast_alloc_bench_audit_glibc PRIVATE ${WARNING_FLAGS})
+    target_link_libraries(fast_alloc_bench_audit_glibc PRIVATE fast_alloc Threads::Threads)
+    fastalloc_stage_asan_runtime(fast_alloc_bench_audit_glibc)
+
+    # Cold-start / thread-lifecycle / burst benchmarks.
+    add_executable(fast_alloc_bench_lifecycle benchmarks/bench_lifecycle.cpp)
+    target_compile_options(fast_alloc_bench_lifecycle PRIVATE ${WARNING_FLAGS})
+    target_link_libraries(fast_alloc_bench_lifecycle PRIVATE fast_alloc Threads::Threads)
+    fastalloc_stage_asan_runtime(fast_alloc_bench_lifecycle)
+
+    # Rigorous cross-allocator benchmark suite (Larsson/mimalloc-bench style
+    # workloads, per-allocator process isolation, JSONL output). No google
+    # benchmark dependency on this one: deterministic op counts + explicit
+    # rep/warmup control are the methodology here.
+    add_executable(bench_suite benchmarks/benchsuite/bench_suite.cpp)
+    target_compile_options(bench_suite PRIVATE ${WARNING_FLAGS})
+    fastalloc_stage_asan_runtime(bench_suite)
+    if(NOT WIN32)
+        target_link_libraries(bench_suite PRIVATE fast_alloc ${CMAKE_DL_LIBS})
+    else()
+        # GetProcessMemoryInfo (psapi.h) resolves to Psapi.lib on some
+        # MinGW/MSVC SDK configurations; harmless when already in kernel32.
+        target_link_libraries(bench_suite PRIVATE fast_alloc psapi)
+    endif()
+    target_link_libraries(bench_suite PRIVATE Threads::Threads)
+
+    target_link_libraries(fast_alloc_bench PRIVATE Threads::Threads)
+    target_link_libraries(fast_alloc_bench_extended PRIVATE Threads::Threads)
+    target_link_libraries(fast_alloc_bench_memory PRIVATE Threads::Threads)
+endif()
+
+# ---------------------------------------------------------------------------
+# Fuzz harnesses (standalone entropy-driven; no libFuzzer dependency)
+# ---------------------------------------------------------------------------
+if(FASTALLOC_BUILD_FUZZ AND NOT MSVC)
+    add_executable(fast_alloc_fuzz_standalone
+        fuzz/fuzz_standalone.cpp
+        src/fast_alloc.cpp
+        src/slab.cpp
+        src/tls_cache.cpp
+        src/global_heap.cpp
+        src/os_memory.cpp
+        src/debug_aid.cpp
+    )
+    target_compile_options(fast_alloc_fuzz_standalone PRIVATE ${WARNING_FLAGS})
+    target_include_directories(fast_alloc_fuzz_standalone PRIVATE include src)
+    target_link_libraries(fast_alloc_fuzz_standalone PRIVATE Threads::Threads)
+
+    include(CTest)
+    # Smoke test: 20-second deterministic campaign; must print FUZZ-CLEAN.
+    add_test(NAME fast_alloc_fuzz_smoke
+        COMMAND fast_alloc_fuzz_standalone 20 42)
+    set_tests_properties(fast_alloc_fuzz_smoke PROPERTIES
+        PASS_REGULAR_EXPRESSION "FUZZ-CLEAN"
+        TIMEOUT 60)
+endif()
+
+include(CheckIPOSupported)
+check_ipo_supported(RESULT lto_supported)
+if(lto_supported AND NOT FASTALLOC_SANITIZE)
+    set_property(TARGET fast_alloc PROPERTY INTERPROCEDURAL_OPTIMIZATION TRUE)
+    if(FASTALLOC_BUILD_TESTS)
+        # Death tests (fork) + LTO is fine, but keep tests non-LTO for
+        # maximum debuggability of the instrumented paths.
+        # set_property(TARGET fast_alloc_tests PROPERTY INTERPROCEDURAL_OPTIMIZATION TRUE)
+    endif()
+    if(FASTALLOC_BUILD_BENCHMARKS)
+        set_property(TARGET fast_alloc_bench PROPERTY INTERPROCEDURAL_OPTIMIZATION TRUE)
+        set_property(TARGET fast_alloc_bench_extended PROPERTY INTERPROCEDURAL_OPTIMIZATION TRUE)
+        set_property(TARGET fast_alloc_bench_memory PROPERTY INTERPROCEDURAL_OPTIMIZATION TRUE)
+        set_property(TARGET fast_alloc_bench_audit PROPERTY INTERPROCEDURAL_OPTIMIZATION TRUE)
+        set_property(TARGET fast_alloc_bench_audit_glibc PROPERTY INTERPROCEDURAL_OPTIMIZATION TRUE)
+        set_property(TARGET bench_suite PROPERTY INTERPROCEDURAL_OPTIMIZATION TRUE)
+    endif()
+endif()
+
+# ---------------------------------------------------------------------------
+# Coverage (gcc): gcov instrumentation + a `coverage` target that runs the
+# test suites and produces a per-file line-coverage report via gcovr when
+# available (falls back to raw gcov summaries otherwise).
+# ---------------------------------------------------------------------------
+if(FASTALLOC_COVERAGE)
+    if(MSVC)
+        message(WARNING "FASTALLOC_COVERAGE is GCC/Clang-only; ignoring.")
+    else()
+        add_compile_options(--coverage -fprofile-arcs -ftest-coverage -g)
+        add_link_options(--coverage)
+        find_program(GCOVR_EXECUTABLE gcovr)
+        add_custom_target(coverage
+            COMMAND ${CMAKE_CTEST_COMMAND} --output-on-failure
+            COMMAND ${GCOVR_EXECUTABLE} -r ${CMAKE_SOURCE_DIR}
+                     --object-directory ${CMAKE_BINARY_DIR}
+                     -e "${CMAKE_SOURCE_DIR}/tests/.*"
+                     -e "${CMAKE_SOURCE_DIR}/_deps/.*"
+                     -e "${CMAKE_SOURCE_DIR}/fuzz/.*"
+                     -e ".*CompilerId.*"
+                     --gcov-ignore-parse-errors negative_hits.warn
+                     --merge-mode-functions separate
+                     --txt -s
+            COMMENT "Running tests and generating gcov coverage report"
+            USES_TERMINAL
+        )
+        if(NOT GCOVR_EXECUTABLE)
+            message(STATUS "gcovr not found: the coverage target will run the tests but skip the report (pip install gcovr to enable)")
+        endif()
+    endif()
+endif()

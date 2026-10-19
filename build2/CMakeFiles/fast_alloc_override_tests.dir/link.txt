@@ -1,0 +1,1 @@
+/usr/bin/c++ -O3 -DNDEBUG -Wl,--dependency-file=CMakeFiles/fast_alloc_override_tests.dir/link.d CMakeFiles/fast_alloc_override_tests.dir/tests/test_new_delete.cpp.o CMakeFiles/fast_alloc_override_tests.dir/tests/sanitizer_defaults.cpp.o -o fast_alloc_override_tests  libfast_alloc.a lib/libgtest_main.a lib/libgtest.a

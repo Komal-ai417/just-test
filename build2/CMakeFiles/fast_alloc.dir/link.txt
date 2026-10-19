@@ -1,0 +1,2 @@
+/usr/bin/ar qc libfast_alloc.a CMakeFiles/fast_alloc.dir/src/fast_alloc.cpp.o CMakeFiles/fast_alloc.dir/src/slab.cpp.o CMakeFiles/fast_alloc.dir/src/tls_cache.cpp.o CMakeFiles/fast_alloc.dir/src/global_heap.cpp.o CMakeFiles/fast_alloc.dir/src/os_memory.cpp.o CMakeFiles/fast_alloc.dir/src/debug_aid.cpp.o
+/usr/bin/ranlib libfast_alloc.a

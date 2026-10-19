@@ -1,0 +1,26 @@
+# FastAlloc clang-tidy configuration.
+# Focus: correctness, lifetime and concurrency issues over style bikeshedding.
+Checks: >
+  -*,
+  bugprone-*,
+  cert-*,
+  clang-analyzer-*,
+  concurrency-*,
+  cppcoreguidelines-*,
+  misc-*,
+  modernize-*,
+  performance-*,
+  portability-*,
+  readability-*,
+  -modernize-use-trailing-return-type,
+  -readability-function-cognitive-complexity,
+  -cppcoreguidelines-avoid-magic-numbers,
+  -readability-magic-numbers,
+  -readability-identifier-length,
+  -modernize-use-nodiscard,
+  -misc-non-private-member-variables-in-classes,
+  -cppcoreguidelines-non-private-member-variables-in-classes,
+  -cppcoreguidelines-pro-type-member-init,
+WarningsAsErrors: 'bugprone-*,cert-*,clang-analyzer-*,concurrency-*'
+HeaderFilterRegex: 'src/.*|include/.*'
+FormatStyle: file

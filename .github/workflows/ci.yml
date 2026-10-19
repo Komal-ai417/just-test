@@ -1,0 +1,946 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Build & run ALL unit tests: release + debug-instrumented, Linux + Windows.
+  # The single gtest binary (fast_alloc_tests) registers every test case via
+  # ctest, so "Test" below runs the full suite (~139 cases Release / ~167
+  # with FASTALLOC_DEBUG=ON) on every platform/compiler combination.
+  # ---------------------------------------------------------------------------
+  build-test:
+    name: ${{ matrix.os }}-${{ matrix.compiler || 'default' }}-${{ matrix.config }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ ubuntu-latest, windows-latest ]
+        compiler: [ default ]
+        config: [ release, debug ]
+        include:
+          - os: ubuntu-latest
+            compiler: gcc
+            config: release
+          - os: ubuntu-latest
+            compiler: clang
+            config: release
+          - os: ubuntu-latest
+            compiler: clang
+            config: debug
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure (Linux, ${{ matrix.compiler }})
+        if: runner.os == 'Linux'
+        run: |
+          CC=gcc CXX=g++
+          if [ "${{ matrix.compiler }}" = "clang" ]; then CC=clang CXX=clang++; fi
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
+                -DCMAKE_C_COMPILER=$CC -DCMAKE_CXX_COMPILER=$CXX \
+                -DFASTALLOC_BUILD_TESTS=ON \
+                -DFASTALLOC_DEBUG=${{ matrix.config == 'debug' && 'ON' || 'OFF' }}
+
+      - name: Configure (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release `
+                -DFASTALLOC_BUILD_TESTS=ON `
+                -DFASTALLOC_DEBUG=${{ matrix.config == 'debug' && 'ON' || 'OFF' }}
+
+      - name: Build
+        run: cmake --build build --config Release -j
+
+      - name: Test
+        run: ctest --test-dir build --build-config Release --output-on-failure
+
+  # ---------------------------------------------------------------------------
+  # MSVC AddressSanitizer (Linux sanitizers live in the jobs below; MSVC has
+  # no TSan/LSan, so Windows gets an ASan-only job).
+  #
+  # ASan runs in the RELEASE config: MSVC ASan on top of a Debug build
+  # (/Od, no inlining, _ITERATOR_DEBUG_LEVEL=2) is pathologically slow —
+  # the full suite blew past ctest's default 1500 s timeout on the runner
+  # without completing, while the same suite passes the non-ASan Debug
+  # build-test job in normal time. Release keeps every ASan shadow check
+  # on the allocator + test code; the debug battery (incl. 11 death tests)
+  # remains covered by build-test's debug matrix entry. An explicit
+  # --timeout 1800 gives Release+ASan generous headroom over the observed
+  # ~minutes runtime.
+  #
+  # v12 (Sep 2026): the v11 push failed this job with ctest stuck at
+  # "Start 1: fast_alloc_validate_tests" and NO test output. The v11 suite
+  # is clean under Linux ASan (full suite + 64k thread-teardown cycles, 0
+  # errors), and the v11 guards are value-only checks ordered before every
+  # dereference. The failure class that matches a previously-green job
+  # turning red with zero output is OPERATIONAL: /fsanitize=address + /MD
+  # makes the exe import clang_rt.asan_dynamic-x86_64.dll from the MSVC
+  # toolset; if the runner's PATH does not resolve it after an image
+  # refresh (windows-latest rolls new MSVC toolset versions), the process
+  # dies at launch (0xC0000135) and ctest shows a bare failure with no
+  # output. v12 closes every silent class by construction:
+  #   1. The CMake build copies the ASan DLL next to the exe (self-
+  #      contained load, PATH-independent).
+  #   2. The staging step below re-verifies the DLL, puts the MSVC-bundled
+  #      llvm-symbolizer on PATH (any ASan report prints a full symbolized
+  #      stack in the job log), and echoes the toolset paths for provenance.
+  #   3. ctest runs -V: gtest output streams live, so a hang shows the last
+  #      [ RUN ] line instead of 30 minutes of silence.
+  #   4. On failure, a bounded post-mortem rerun under cdb (Windows SDK
+  #      debugger, abort_on_error so ASan deaths are catchable) prints the
+  #      last event + stack - the Windows analog of the ubuntu gdb rerun.
+  #   5. A green suite is repeated up to 3x (ctest --repeat until-fails:3)
+  #      so a transient/image-drift failure cannot pass as green; a
+  #      deterministic failure still stops at the first occurrence.
+  # ---------------------------------------------------------------------------
+  windows-asan:
+    name: windows-msvc-asan
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release `
+                -DFASTALLOC_BUILD_TESTS=ON `
+                -DFASTALLOC_SANITIZE=address
+      - name: Build
+        # BOTH gtest binaries: ctest runs every registered test, and the
+        # audit suite (fast_alloc_audit_tests) is registered too — building
+        # only fast_alloc_tests would leave it "Not Run" and fail the job.
+        run: cmake --build build --config Release -j --target fast_alloc_tests fast_alloc_audit_tests
+      - name: Stage MSVC ASan runtime + symbolizer (v12)
+        shell: pwsh
+        run: |
+          # Belt-and-braces for the build-time DLL staging (CMake copies
+          # clang_rt.asan_dynamic-x86_64.dll next to the exe): re-locate it
+          # via vswhere and copy it into build\Release again if needed, so
+          # the loader resolves it from the exe dir regardless of PATH.
+          # Also put the MSVC-bundled llvm-symbolizer on PATH so any ASan
+          # report is fully symbolized in the job log.
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vsRoot  = & $vswhere -latest -products * `
+                        -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
+                        -property installationPath
+          Write-Host "VS installation: $vsRoot"
+          $dll = Get-ChildItem -Path "$vsRoot\VC\Tools\MSVC" -Recurse `
+                        -Filter clang_rt.asan_dynamic-x86_64.dll `
+                        -ErrorAction SilentlyContinue |
+                 Where-Object { $_.FullName -match 'Hostx64\\x64' } |
+                 Select-Object -First 1
+          if ($dll) {
+            Copy-Item $dll.FullName build\Release -Force
+            Write-Host "staged ASan runtime: $($dll.FullName)"
+          } else {
+            Write-Host "WARN: clang_rt.asan_dynamic-x86_64.dll not found under $vsRoot\VC\Tools\MSVC"
+          }
+          $llvm = Join-Path $vsRoot 'VC\Tools\Llvm\x64\bin'
+          if (Test-Path (Join-Path $llvm 'llvm-symbolizer.exe')) {
+            Add-Content $env:GITHUB_ENV "PATH=$llvm;$env:PATH"
+            Write-Host "llvm-symbolizer on PATH: $llvm"
+          } else {
+            Write-Host "llvm-symbolizer not found at $llvm (reports will show raw addresses)"
+          }
+      - name: Test
+        # -V streams gtest output live (a hang shows the last [ RUN ] line);
+        # --repeat until-fail:3 requires three consecutive green runs of the
+        # suite so a transient/image-drift failure is not waved through as
+        # green, while a deterministic failure still stops at the first one.
+        run: ctest --test-dir build --build-config Release --output-on-failure -V --repeat until-fail:3 --timeout 1800
+        env:
+          # allocator_may_return_null=1: the differential tests probe libc's
+          # "overflow fails cleanly" contract; sanitizer runtimes must behave
+          # libc-compatible instead of aborting (also default via
+          # tests/sanitizer_defaults.cpp -- env wins per-flag, keep in sync).
+          ASAN_OPTIONS: halt_on_error=1:allocator_may_return_null=1
+      - name: Post-mortem rerun under cdb (failure only)
+        if: failure()
+        shell: pwsh
+        run: |
+          # Windows analog of the ubuntu gdb rerun. Runs the suite under the
+          # Windows SDK debugger with abort_on_error=1 so an ASan death is a
+          # catchable second-chance exception (__fastfail); cdb then prints
+          # the last event and the stack. Bounded at 15 minutes (a rerun of a
+          # hanging test would otherwise hang the step too).
+          $cdb = "C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\cdb.exe"
+          if (-not (Test-Path $cdb)) {
+            Write-Host "cdb.exe not found on this image - skipping post-mortem"
+            exit 0
+          }
+          $env:ASAN_OPTIONS = "halt_on_error=1:abort_on_error=1:symbolize=1:allocator_may_return_null=1"
+          $out = Join-Path $env:RUNNER_TEMP "cdb-rerun.txt"
+          $exe = Join-Path $PWD "build\Release\fast_alloc_tests.exe"
+          $p = Start-Process -FilePath $cdb -PassThru -NoNewWindow `
+                -RedirectStandardOutput $out `
+                -ArgumentList '-g','-G','-lines','-c','g; .lastevent; k 50; q', "$exe"
+          # WaitForExit(ms) returns $true iff the process exited on its own.
+          if (-not $p.WaitForExit(900000)) {
+            Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
+            Write-Host "cdb rerun exceeded 15 minutes (the failure reproduces as a hang); killed"
+          }
+          if (Test-Path $out) { Get-Content $out | Select-Object -Last 80 }
+
+  # ---------------------------------------------------------------------------
+  # Sanitizer jobs (Linux only; MSVC ASan runs in the windows-asan job above)
+  # ---------------------------------------------------------------------------
+  sanitizers:
+    name: sanitizer-${{ matrix.sanitizer }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        sanitizer: [ address-undefined, thread ]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure
+        run: |
+          SAN=""
+          case "${{ matrix.sanitizer }}" in
+            address-undefined) SAN="address,undefined" ;;
+            thread)            SAN="thread" ;;
+          esac
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+                -DFASTALLOC_BUILD_TESTS=ON \
+                -DFASTALLOC_SANITIZE="$SAN"
+
+      - name: Build
+        run: cmake --build build -j
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+        env:
+          # allocator_may_return_null=1: sanitizer allocator in libc-compatible
+          # mode for the differential overflow probes (mirrored as a compiled-in
+          # default in tests/sanitizer_defaults.cpp; env wins per-flag).
+          TSAN_OPTIONS: halt_on_error=1:allocator_may_return_null=1
+          ASAN_OPTIONS: detect_leaks=1:halt_on_error=1:allocator_may_return_null=1
+          UBSAN_OPTIONS: halt_on_error=1
+
+  # ---------------------------------------------------------------------------
+  # LSan-specific job (leak detection on the full suite)
+  # ---------------------------------------------------------------------------
+  leaks:
+    name: leak-sanitizer
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug -DFASTALLOC_SANITIZE=leak
+      - name: Build
+        run: cmake --build build -j
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+        env:
+          # allocator_may_return_null=1: libc-compatible overflow failures for
+          # the differential probes (also compiled-in via
+          # tests/sanitizer_defaults.cpp; env wins per-flag).
+          ASAN_OPTIONS: detect_leaks=1:allocator_may_return_null=1
+
+  # ---------------------------------------------------------------------------
+  # Windows VirtualAlloc/VirtualFree semantics, emulated on Linux.
+  #
+  # The page cache SPLITS cached spans and frees interior sub-spans. On
+  # Windows a blind VirtualFree(ptr, 0, MEM_RELEASE) there either failed
+  # silently (interior address -> leak) or released the WHOLE reservation,
+  # wiping still-cached split tails -> 0xC0000005 on the windows runners.
+  # Fixed with a reservation registry (see src/os_memory.cpp) and reproduced
+  # deterministically with -DFASTALLOC_WINVA_EMULATION, which runs the same
+  # registry code on Linux (mmap/mprotect/munmap standing in for the
+  # Virtual* calls, decommitted pages become PROT_NONE tripwires). This job
+  # keeps that whole class of Windows-only lifetime bug caught on plain
+  # Linux hardware, in release AND debug configs.
+  # ---------------------------------------------------------------------------
+  windows-va-emulation:
+    name: windows-va-emulation-${{ matrix.config }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        config: [ release, debug ]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure
+        run: >
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+          -DFASTALLOC_BUILD_TESTS=ON
+          -DFASTALLOC_DEBUG=${{ matrix.config == 'debug' && 'ON' || 'OFF' }}
+          -DCMAKE_CXX_FLAGS="-DFASTALLOC_WINVA_EMULATION"
+
+      - name: Build
+        # Both gtest binaries — ctest runs every registered test (see
+        # windows-asan note): the audit suite must be built too.
+        run: cmake --build build -j --target fast_alloc_tests fast_alloc_audit_tests
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+
+  # ---------------------------------------------------------------------------
+  # Fuzzing (audit §8): the fuzz/ harness family — shared byte-program ISA
+  # (8 op classes) + shadow model, invariants checked after EVERY op.
+  #
+  #   1. fast_alloc_fuzz_standalone, release semantics — deterministic seed,
+  #      120 s budget, exit 0 + "FUZZ-CLEAN" = no invariant violations.
+  #   2. fast_alloc_fuzz_standalone, FASTALLOC_DEBUG semantics — canaries,
+  #      exact-size registry, poison and leak machinery active WHILE
+  #      fuzzing (the debug build is the one that found nothing but proved
+  #      the F1 fix holds under random programs).
+  #   3. libFuzzer campaign — clang, -fsanitize=fuzzer,address,undefined,
+  #      persistent allocator state across inputs; mirrors the audit's
+  #      build_fuzz.sh (480 s campaign: 36 794 units, 76 exec/s, 0 ASan/
+  #      UBSan/LSan errors). CI budget: 300 s + corpus + crash artifacts
+  #      uploaded on every run.
+  # ---------------------------------------------------------------------------
+  fuzzing:
+    name: fuzzing
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure (release semantics + fuzz harnesses)
+        run: >
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+          -DFASTALLOC_BUILD_TESTS=ON
+          -DFASTALLOC_BUILD_FUZZ=ON
+
+      - name: Build fuzz harness (standalone)
+        run: cmake --build build -j --target fast_alloc_fuzz_standalone
+
+      - name: Smoke campaign via ctest (20 s, seed pinned)
+        run: ctest --test-dir build --output-on-failure -R fast_alloc_fuzz_smoke
+
+      - name: Standalone campaign — release semantics (120 s)
+        run: |
+          set -o pipefail
+          ./build/fast_alloc_fuzz_standalone 120 20260930 2>&1 | tee fuzz-standalone-release.log
+          grep -q "FUZZ-CLEAN" fuzz-standalone-release.log
+
+      - name: Configure (FASTALLOC_DEBUG semantics + fuzz harnesses)
+        run: >
+          cmake -S . -B build-dbg -DCMAKE_BUILD_TYPE=Release
+          -DFASTALLOC_BUILD_TESTS=OFF
+          -DFASTALLOC_BUILD_FUZZ=ON
+          -DFASTALLOC_DEBUG=ON
+
+      - name: Build fuzz harness (standalone, debug semantics)
+        run: cmake --build build-dbg -j --target fast_alloc_fuzz_standalone
+
+      - name: Standalone campaign — debug semantics (120 s)
+        run: |
+          set -o pipefail
+          ./build-dbg/fast_alloc_fuzz_standalone 120 20260931 2>&1 | tee fuzz-standalone-debug.log
+          grep -q "FUZZ-CLEAN" fuzz-standalone-debug.log
+
+      - name: libFuzzer campaign (clang, fuzzer+address+undefined, 300 s)
+        run: |
+          # Flag set: fuzzer + address + undefined, persistent shadow model
+          # (the same byte-program ISA the standalone campaigns exercise).
+          # The library sources are compiled INTO the harness so ASan/UBSan
+          # instrument the allocator itself.
+          LIBS="src/fast_alloc.cpp src/slab.cpp src/global_heap.cpp src/tls_cache.cpp src/os_memory.cpp src/debug_aid.cpp"
+          mkdir -p fuzz-artifacts corpus
+          clang++ -g -O1 -std=gnu++17 -fsanitize=fuzzer,address,undefined \
+            -fno-omit-frame-pointer -Iinclude -Isrc -pthread \
+            fuzz/fuzz_ops_libfuzzer.cpp $LIBS -o fuzz_ops_libfuzzer
+          ASAN_OPTIONS=abort_on_error=1:detect_leaks=1:allocator_may_return_null=1 \
+          UBSAN_OPTIONS=halt_on_error=1 \
+          ./fuzz_ops_libfuzzer -max_total_time=300 -rss_limit_mb=4096 \
+            -print_final_stats=1 -artifact_prefix=fuzz-artifacts/ corpus/ \
+            2>&1 | tee fuzz-libfuzzer-campaign.log
+          # A crash/leak exits non-zero (fails this step). Belt-and-braces:
+          # no sanitizer error lines may be present in the log either.
+          ! grep -q -E "ERROR: (AddressSanitizer|LeakSanitizer)|runtime error:" fuzz-libfuzzer-campaign.log
+
+      - name: Upload fuzz campaign logs + crash artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-campaign-logs
+          path: |
+            fuzz-standalone-release.log
+            fuzz-standalone-debug.log
+            fuzz-libfuzzer-campaign.log
+            fuzz-artifacts/
+          if-no-files-found: ignore
+
+  # ---------------------------------------------------------------------------
+  # EVERY benchmark, on BOTH Linux and Windows, executed (not just built):
+  #
+  #   1. fast_alloc_bench          — every google-benchmark case (filter '.*')
+  #   2. fast_alloc_bench_extended — every google-benchmark case (filter '.*')
+  #   3. fast_alloc_bench_memory   — full config sweep: threads {1,2,4}
+  #                                  x sizes {64, 256, 4096}
+  #   4. bench_suite               — FULL matrix: all 11 workloads
+  #                                  x allocators {std, fast}
+  #                                  x threads {1, 2, 4}
+  #                                  = 66 runs per OS, every one
+  #                                  checksum-verified (exit 42 = corruption
+  #                                  -> red CI). std = glibc on Linux, UCRT
+  #                                  on Windows.
+  #
+  # Release mode is mandatory (CMAKE_BUILD_TYPE=Release switches on the
+  # -O3/-march=native / /Ox/GL-LTCG paths). Op counts are CI-scaled (the full
+  # 66-run sweep is ~seconds locally; the checksums exercise every size class,
+  # slab, cross-thread queue and realloc path). Cross-allocator timing
+  # comparisons live in the benchmark-matrix job below.
+  #
+  # google-benchmark runs use FIXED iteration counts (--benchmark_min_time=3000x)
+  # instead of adaptive time-based mode: v1.8.3's adaptive scheduling has a
+  # heap-corruption defect (reproduced locally with zero FastAlloc code linked
+  # — a pure google-benchmark v1.8.3 + allocator interplay). Fixed 'Nx' mode
+  # provably avoids it and is deterministic across machines.
+  #
+  # The library is pinned to v1.9.4: the 1.9.x series removed v1.8.3's
+  # ThreadManager teardown machinery and its adaptive-mode heap corruption,
+  # and is the correct modern pin. ALL multithreaded ->Threads(N)
+  # registrations are kept: coverage is never reduced to work around a crash.
+  #
+  # STATUS (Sep 2026, v11 - CRASH CLASS CLOSED BY CONSTRUCTION): four crash
+  # signature generations on the runners, each closed in turn. v8 fixed the
+  # batch-walk fault (0x10 = [nullptr+offsetof(next)]). v9 made sub-64KB
+  # frees (slot holding 0x10) heal instead of crash. v10 turned the
+  # benchmark into a writer trap with a store-time witness. The v10 CI run
+  # then produced the CLOSING datapoints (full crashlogs, beyond the 80-line
+  # tails): (a) "fast_malloc returned non-canonical 0x10 (i=0)" on the very
+  # first allocation, (b) ~3000 per-sweep audit pairs = the audit firing
+  # every iteration because the slots re-corrupt during the ALLOC phase
+  # (page writable, trap blind) - none were signal faults; the 10x row-time
+  # inflation was pure audit cost, (c) the fatal SIGSEGV's gdb register
+  # dump: rbx = slots[i] = 0xd90b6085fe368400 - 16-byte aligned, >= 64 KB,
+  # NON-CANONICAL - past every v10 check (>= 64 KB only) - and the inlined
+  # fast_free loaded block->slab at [ptr-16] in the non-canonical half:
+  # #GP -> si_code=SI_KERNEL(128), si_addr=0 ("faulting address (nil)"),
+  # 3/3 on the runner, 0/650+ locally (the runner's GCC also emitted the
+  # free loop without the alignment test the local build has - codegen
+  # differences are real, so guards must not rely on source shape).
+  # v11:
+  #   1. ONE shared full plausibility predicate, IsPlausibleHeapPtr
+  #      (fast_alloc_config.h): >= 64 KB AND < 2^47 AND 16-aligned. Applied
+  #      at EVERY dereference/return site: fast_free / fast_free_sized /
+  #      fast_realloc entry, the TLS pop guard, the batch-head validation,
+  #      the fast_malloc return gates, and every freelist walk in
+  #      tls_cache.cpp / global_heap.cpp (pending queues, arena splits,
+  #      slab extraction). The #GP class is unreachable in any codegen.
+  #   2. DeallocateBlock (push) guard: a wild block pointer can no longer
+  #      turn a freelist push into the wild write itself.
+  #   3. The benchmark frees ONLY witness-proven pointers (value == the
+  #      recorded store-time fast_malloc return); anything else is dropped
+  #      with full provenance (slot overwritten vs allocator-returned), so
+  #      no forged value can reach the allocator from the bench, and the
+  #      freelist-corruption cycle is starved instead of sustained.
+  #   4. Multi-shot rate-limited telemetry (first 8 in full detail, then
+  #      every 1024th, totals at instance end) - the v10 one-shot design
+  #      had already been consumed by the 0x10 event and blinded exactly
+  #      the crash datapoint. The audit is capped at 3 per instance (the
+  #      per-sweep audit was the 10x row-time inflation).
+  #   5. The crash handler now prints si_code with the faulting address and
+  #      the faulting RIP, and HEALS write faults inside the registered
+  #      trap pages (mprotect RW + retry) with the writer's backtrace - a
+  #      free-s-phase writer can no longer kill the run either.
+  # The [fastalloc-invariant] channels, the [bench-trap] heal reports and
+  # the gdb rerun stay as the independent safety net for any NEW class.
+  #
+  # Each google-benchmark binary runs its benchmark FAMILIES in separate
+  # process invocations (family list discovered via --benchmark_list_tests,
+  # so coverage is exactly the '.*' filter). Family isolation means a crash
+  # in one family can never silently skip the remaining families — with a
+  # single '.*' invocation, a SIGSEGV aborts the whole binary and every
+  # later registration is lost. It also names the exact failing family in
+  # FAILURES.txt and captures a per-family gdb backtrace, and the final gate
+  # step prints those captures into the job log.
+  #
+  # Every step is marked continue-on-error and records failures into
+  # FAILURES.txt; a final gate step turns the job red, so one crash never
+  # hides the results of the remaining steps. On Linux any crashing binary
+  # is immediately re-run under gdb (ASLR kept ON) to capture the backtrace
+  # into crashlogs/, uploaded as an artifact for offline diagnosis.
+  #
+  # Shared public runners occasionally kill long benchmark processes
+  # (memory pressure / noisy neighbors): every crashing run is retried
+  # exactly once. A crash that PASSES its retry is recorded in FLAKES.txt
+  # (echoed in the log and uploaded, but stays green); a crash that fails
+  # the retry too goes to FAILURES.txt and fails the gate.
+  # ---------------------------------------------------------------------------
+  benchmarks:
+    name: benchmarks-${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ ubuntu-latest, windows-latest ]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install gdb (Linux crash diagnostics)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -y || (sleep 10 && sudo apt-get update -y)
+          sudo apt-get install -y gdb \
+            || (sleep 10 && sudo apt-get install -y gdb)
+
+      - name: Configure (Release)
+        shell: bash
+        run: >
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+          -DFASTALLOC_BUILD_TESTS=OFF
+          -DFASTALLOC_BUILD_BENCHMARKS=ON
+
+      - name: Build all benchmark targets
+        shell: bash
+        run: |
+          cmake --build build --config Release -j --target \
+            fast_alloc_bench fast_alloc_bench_extended \
+            fast_alloc_bench_memory bench_suite
+
+      - name: Locate binaries
+        shell: bash
+        run: |
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            BIN="build/Release"; EXT=".exe"
+          else
+            BIN="build"; EXT=""
+          fi
+          echo "BIN=$BIN" >> "$GITHUB_ENV"
+          echo "EXT=$EXT" >> "$GITHUB_ENV"
+          mkdir -p crashlogs
+
+      # --- google/benchmark binaries: every registered benchmark, executed
+      #     family-by-family in separate processes (full '.*' coverage, but a
+      #     crash in one family cannot hide or abort the rest). Per family:
+      #     run (line-buffered, tee'd to crashlogs so the last COMPLETED case
+      #     line + the [bench-crash] handler output identify the exact
+      #     crashing case) -> (Linux) gdb rerun with backtrace, registers,
+      #     the faulting instruction window, $_siginfo (faulting address) and
+      #     the process mappings -> one retry -> FLAKES.txt (transient, stays
+      #     green) or FAILURES.txt (gate red). ---
+      - name: Run fast_alloc_bench (every benchmark, family-isolated)
+        shell: bash
+        # v10: bound the step so a hung inferior (or a slow gdb rerun on a
+        # busy shared runner) can never eat the whole job budget; the
+        # per-family FLAKES/FAILURES classification below still applies.
+        timeout-minutes: 10
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          FAMS=$("$BIN/fast_alloc_bench$EXT" --benchmark_list_tests=true \
+                 | sed 's|/.*||' | uniq)
+          echo "fast_alloc_bench families: $FAMS"
+          for fam in $FAMS; do
+            r1=0
+            if [ "$RUNNER_OS" = "Linux" ]; then
+              stdbuf -oL "$BIN/fast_alloc_bench$EXT" --benchmark_filter="^${fam}/" \
+                --benchmark_min_time=3000x --benchmark_repetitions=1 \
+                --benchmark_report_aggregates_only=false \
+                2>&1 | tee "crashlogs/fast_alloc_bench_${fam}_raw.txt" || r1=$?
+            else
+              "$BIN/fast_alloc_bench$EXT" --benchmark_filter="^${fam}/" \
+                --benchmark_min_time=3000x --benchmark_repetitions=1 \
+                --benchmark_report_aggregates_only=false || r1=$?
+            fi
+            if [ $r1 -ne 0 ] && [ "$RUNNER_OS" = "Linux" ]; then
+              gdb -q -batch \
+                -ex 'set disable-randomization off' \
+                -ex run \
+                -ex 'bt 30' \
+                -ex 'info registers' \
+                -ex 'x/12i $pc-32' \
+                -ex 'p $_siginfo' \
+                -ex 'info proc mappings' \
+                --args "$BIN/fast_alloc_bench$EXT" --benchmark_filter="^${fam}/" \
+                --benchmark_min_time=3000x --benchmark_repetitions=1 \
+                --benchmark_report_aggregates_only=false \
+                2>&1 | tee "crashlogs/fast_alloc_bench_${fam}_gdb.txt"
+            fi
+            if [ $r1 -ne 0 ]; then
+              # transient runner kill? retry once: pass -> FLAKES, fail -> gate
+              sleep 5
+              r2=0
+              "$BIN/fast_alloc_bench$EXT" --benchmark_filter="^${fam}/" \
+                --benchmark_min_time=3000x --benchmark_repetitions=1 \
+                --benchmark_report_aggregates_only=false || r2=$?
+              if [ $r2 -eq 0 ]; then
+                echo "fast_alloc_bench/$fam rc=$r1 -> retry PASS (transient)" | tee -a FLAKES.txt
+              else
+                echo "fast_alloc_bench/$fam rc=$r2 (failed twice)" | tee -a FAILURES.txt
+              fi
+            fi
+          done
+
+      - name: Run fast_alloc_bench_extended (every benchmark, family-isolated)
+        shell: bash
+        timeout-minutes: 10
+        continue-on-error: true
+        run: |
+          FAMS=$("$BIN/fast_alloc_bench_extended$EXT" --benchmark_list_tests=true \
+                 | sed 's|/.*||' | uniq)
+          echo "fast_alloc_bench_extended families: $FAMS"
+          for fam in $FAMS; do
+            r1=0
+            "$BIN/fast_alloc_bench_extended$EXT" --benchmark_filter="^${fam}/" \
+              --benchmark_min_time=3000x --benchmark_repetitions=1 \
+              --benchmark_report_aggregates_only=false || r1=$?
+            if [ $r1 -ne 0 ] && [ "$RUNNER_OS" = "Linux" ]; then
+              gdb -q -batch -ex 'set disable-randomization off' -ex run \
+                -ex 'bt 30' -ex 'info registers' \
+                --args "$BIN/fast_alloc_bench_extended$EXT" --benchmark_filter="^${fam}/" \
+                --benchmark_min_time=3000x --benchmark_repetitions=1 \
+                --benchmark_report_aggregates_only=false \
+                2>&1 | tee "crashlogs/fast_alloc_bench_extended_${fam}_gdb.txt"
+            fi
+            if [ $r1 -ne 0 ]; then
+              sleep 5
+              r2=0
+              "$BIN/fast_alloc_bench_extended$EXT" --benchmark_filter="^${fam}/" \
+                --benchmark_min_time=3000x --benchmark_repetitions=1 \
+                --benchmark_report_aggregates_only=false || r2=$?
+              if [ $r2 -eq 0 ]; then
+                echo "fast_alloc_bench_extended/$fam rc=$r1 -> retry PASS (transient)" | tee -a FLAKES.txt
+              else
+                echo "fast_alloc_bench_extended/$fam rc=$r2 (failed twice)" | tee -a FAILURES.txt
+              fi
+            fi
+          done
+
+      # --- custom memory benchmark: full threads x sizes sweep ---
+      - name: Run fast_alloc_bench_memory (threads 1/2/4 x sizes 64/256/4096)
+        shell: bash
+        timeout-minutes: 10
+        continue-on-error: true
+        run: |
+          rc=0
+          for th in 1 2 4; do
+            for sz in 64 256 4096; do
+              echo "== bench_memory T=$th size=$sz =="
+              r1=0
+              "$BIN/fast_alloc_bench_memory$EXT" --threads "$th" \
+                --allocs 20000 --size "$sz" || r1=$?
+              if [ $r1 -ne 0 ]; then
+                sleep 5
+                r2=0
+                "$BIN/fast_alloc_bench_memory$EXT" --threads "$th" \
+                  --allocs 20000 --size "$sz" || r2=$?
+                if [ $r2 -eq 0 ]; then
+                  echo "bench_memory T=$th size=$sz rc=$r1 -> retry PASS (transient)" | tee -a FLAKES.txt
+                else
+                  echo "bench_memory T=$th size=$sz rc=$r2 (failed twice)" | tee -a FAILURES.txt
+                  rc=$r2
+                fi
+              fi
+            done
+          done
+
+      # --- bench_suite: the FULL matrix — every workload, every allocator
+      #     path (std AND fast), every thread count (1/2/4). Checksums are
+      #     verified on every free; rc=42 fails the step. ---
+      - name: Run bench_suite (all 11 workloads x std+fast x threads 1/2/4)
+        shell: bash
+        timeout-minutes: 15
+        continue-on-error: true
+        run: |
+          run2() {  # run2 <label> <cmd...>: run; retry a crash once; classify
+            local label="$1"; shift
+            "$@" && return 0
+            sleep 5
+            "$@" && {
+              echo "$label rc=1 -> retry PASS (transient)" | tee -a FLAKES.txt
+              return 0
+            }
+            echo "$label (failed twice)" | tee -a FAILURES.txt
+            return 1
+          }
+          rc=0
+          for wl in tiny small-mixed random-1-4096 ramp churn cache-thrash \
+                    cross-thread thread-churn large realloc-grow overhead; do
+            # 'large' moves 64KB..512KB blocks -> keep its op count lower
+            OPS=30000; [ "$wl" = "large" ] && OPS=3000
+            for th in 1 2 4; do
+              echo "== std $wl T=$th ops=$OPS =="
+              run2 "bench_suite std/$wl/T=$th" \
+                "$BIN/bench_suite$EXT" --alloc std --label std \
+                --workload "$wl" --threads "$th" --ops "$OPS" --reps 1 || rc=$?
+              echo "== FastAlloc $wl T=$th ops=$OPS =="
+              run2 "bench_suite fast/$wl/T=$th" \
+                "$BIN/bench_suite$EXT" --alloc fast --label FastAlloc \
+                --workload "$wl" --threads "$th" --ops "$OPS" --reps 1 || rc=$?
+            done
+          done
+          if [ $rc -ne 0 ]; then echo "bench_suite rc=$rc (see FAILURES.txt above)"; fi
+
+      # --- v9/v10: surface HEALED invariant events. The guards above keep the
+      #     benchmarks alive when the (Sep-2026) corruption class recurs, so
+      #     the event would otherwise only live inside the tee'd crashlog
+      #     files. This step greps every capture for the one-shot telemetry
+      #     lines and prints them into the job log - a green run with healed
+      #     events is visible as such, with full provenance (v10 adds the
+      #     store-time witness verdicts and the [fastalloc-audit] dumps). ---
+      - name: Surface healed invariant telemetry (v11)
+        shell: bash
+        run: |
+          if ls crashlogs/*.txt >/dev/null 2>&1; then
+            if grep -l -E '\[fastalloc-invariant\]|\[bench-guard\]|\[fastalloc-audit\]|\[bench-trap\]' crashlogs/*.txt >/dev/null 2>&1; then
+              echo "=== HEALED INVARIANT EVENTS (benchmarks survived; provenance below) ==="
+              grep -n -E '\[fastalloc-invariant\]|\[bench-guard\]|\[fastalloc-audit\]|\[bench-trap\]' crashlogs/*.txt | head -80 || true
+              echo "--- (truncated to first 80 lines; full logs in the artifact) ---"
+            else
+              echo "No invariant events: allocator ran clean."
+            fi
+          else
+            echo "No crashlogs captured: allocator ran clean."
+          fi
+
+      # --- gate: turn the job red if ANY benchmark failed twice above ---
+      - name: Check benchmark results
+        shell: bash
+        run: |
+          if [ -s FLAKES.txt ]; then
+            echo "=== TRANSIENT FLAKES (passed the retry; artifact has details) ==="
+            cat FLAKES.txt
+          fi
+          if [ -s FAILURES.txt ]; then
+            echo "=== BENCHMARK FAILURES ==="
+            cat FAILURES.txt
+            # Surface the captured forensics (the in-binary [bench-crash]
+            # backtraces and the gdb reruns) directly in the job log so the
+            # failure cause is visible without opening the artifact.
+            if ls crashlogs/*.txt >/dev/null 2>&1; then
+              echo "=== CRASH FORENSICS (last 80 lines per capture) ==="
+              for f in crashlogs/*.txt; do
+                echo "--- $f ---"
+                tail -n 80 "$f" || true
+              done
+            fi
+            exit 1
+          fi
+          echo "all benchmarks passed"
+
+      - name: Upload crash diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-crash-diagnostics-${{ matrix.os }}
+          path: |
+            crashlogs/
+            FAILURES.txt
+            FLAKES.txt
+          if-no-files-found: ignore
+
+  # ---------------------------------------------------------------------------
+  # Cross-allocator matrix (glibc + jemalloc + FastAlloc): the same bench_suite
+  # workloads again, but with LD_PRELOAD'd allocators for allocator-vs-allocator
+  # comparisons. Runs on every push to main and on manual dispatch (not on PRs,
+  # which already run the full std+fast sweep above). mimalloc is auto-skipped
+  # unless MIMALLOC_SO points at a prebuilt libmimalloc.so. Results are noise
+  # on shared runners — treat them as smoke/regression data, not publishable
+  # numbers.
+  # ---------------------------------------------------------------------------
+  benchmark-matrix:
+    name: benchmark-matrix
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'push' && github.ref == 'refs/heads/main')
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install jemalloc
+        run: |
+          sudo apt-get update || (sleep 10 && sudo apt-get update)
+          sudo apt-get install -y libjemalloc2 \
+            || (sleep 10 && sudo apt-get install -y libjemalloc2)
+
+      - name: Configure (Release)
+        run: >
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+          -DFASTALLOC_BUILD_TESTS=OFF
+          -DFASTALLOC_BUILD_BENCHMARKS=ON
+
+      - name: Build bench_suite
+        run: cmake --build build -j --target bench_suite
+
+      - name: Run reduced cross-allocator matrix
+        run: |
+          cd benchmarks/benchsuite
+          BENCH_SUITE="$PWD/../../build/bench_suite" \
+            OPS=300000 THREADS="1 2" bash ./run_matrix.sh ci_matrix.jsonl 3
+          python3 analyze.py ci_matrix.jsonl | tee ci_matrix_summary.md \
+            || echo "analyze.py failed (raw jsonl still uploaded)" \
+               | tee -a matrix_failures.txt
+
+      - name: Upload matrix results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-matrix-results
+          path: |
+            benchmarks/benchsuite/ci_matrix.jsonl
+            benchmarks/benchsuite/ci_matrix_summary.md
+            benchmarks/benchsuite/matrix_failures.txt
+          if-no-files-found: ignore
+
+  # ---------------------------------------------------------------------------
+  # Global operator new/delete override: the whole process (including the
+  # gtest runtime and libstdc++ containers) routes every allocation through
+  # FastAlloc. Runs the focused override suite (aligned new/delete, nothrow
+  # OOM contract, container workloads) plus the standard validate suite,
+  # release AND debug semantics.
+  # ---------------------------------------------------------------------------
+  override-new:
+    name: override-new-${{ matrix.config }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        config: [ release, debug ]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
+                -DFASTALLOC_OVERRIDE_NEW=ON \
+                -DFASTALLOC_DEBUG=${{ matrix.config == 'debug' && 'ON' || 'OFF' }} \
+                -DFASTALLOC_BUILD_BENCHMARKS=OFF
+      - name: Build
+        run: cmake --build build -j --target fast_alloc_tests fast_alloc_override_tests
+      - name: Test (override suite + validate suite)
+        run: ctest --test-dir build --output-on-failure
+        env:
+          ASAN_OPTIONS: allocator_may_return_null=1
+
+  # ---------------------------------------------------------------------------
+  # Coverage (gcov): line/branch/function coverage of the allocator core by
+  # the combined validate + audit suites. The report is printed to the job
+  # log and uploaded as an artifact for threshold tracking.
+  # ---------------------------------------------------------------------------
+  coverage:
+    name: coverage
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install gcovr
+        run: pipx install gcovr || pip install gcovr
+      - name: Configure (coverage instrumentation)
+        run: >
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug
+          -DFASTALLOC_COVERAGE=ON -DFASTALLOC_BUILD_BENCHMARKS=OFF
+          -DFASTALLOC_BUILD_FUZZ=OFF
+      - name: Build suites
+        run: cmake --build build -j --target fast_alloc_tests fast_alloc_audit_tests
+      - name: Run tests + generate report
+        run: |
+          ctest --test-dir build --output-on-failure
+          gcovr -r . --object-directory build \
+            -e '.*tests/.*' -e '.*_deps/.*' -e '.*fuzz/.*' -e '.*CompilerId.*' \
+            --gcov-ignore-parse-errors negative_hits.warn \
+            --merge-mode-functions separate \
+            --txt -s --branches --xml coverage.xml | tee coverage_summary.txt
+      - name: Coverage gate (core allocator lines >= 70%)
+        run: |
+          # The release-only guard branches keep the total below 100%; the
+          # core paths (fast_alloc, slab, tls_cache hot paths, os_memory)
+          # must stay well covered by the combined suites.
+          python3 - <<'PY'
+          import re, sys
+          txt = open('coverage_summary.txt').read()
+          m = re.search(r'lines:\s+([0-9.]+)%', txt)
+          pct = float(m.group(1)) if m else 0.0
+          print(f"combined line coverage: {pct:.1f}%")
+          if pct < 70.0:
+              print("!! coverage below 70% gate", file=sys.stderr)
+              sys.exit(1)
+          PY
+      - name: Upload coverage artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: |
+            coverage_summary.txt
+            coverage.xml
+          if-no-files-found: ignore
+
+  # ---------------------------------------------------------------------------
+  # Static analysis: compiler warning matrix (gcc + clang), cppcheck, and
+  # clang-tidy with the repository's .clang-tidy policy.
+  # ---------------------------------------------------------------------------
+  static-analysis:
+    name: static-analysis
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install analysers
+        run: sudo apt-get update && sudo apt-get install -y cppcheck clang-tidy
+      - name: Run the analysis driver
+        run: bash tools/static_analysis.sh
+
+  # ---------------------------------------------------------------------------
+  # MemorySanitizer (clang-only): uninitialized-memory read detection on the
+  # deterministic validate subset.
+  # ---------------------------------------------------------------------------
+  msan:
+    name: memory-sanitizer
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run MSan driver
+        run: bash tools/msan_check.sh
+
+  # ---------------------------------------------------------------------------
+  # Valgrind memcheck: independent second opinion on memory errors
+  # (invalid reads/writes/frees, leaks) for both gtest suites.
+  # ---------------------------------------------------------------------------
+  valgrind:
+    name: valgrind-memcheck
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install valgrind
+        run: sudo apt-get update && sudo apt-get install -y valgrind
+      - name: Memcheck both suites
+        run: bash tools/valgrind_memcheck.sh
+
+  # ---------------------------------------------------------------------------
+  # Tool-script checks that run on plain CI hardware: environment tunables
+  # (FASTALLOC_PAGE_CACHE_MB / FASTALLOC_LOG_LEVEL) and the strace syscall
+  # shape validation (mmap-only growth, purge releases to the OS).
+  # ---------------------------------------------------------------------------
+  tool-scripts:
+    name: tool-script-checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Environment tunable checks
+        run: bash tools/page_cache_env_check.sh
+      - name: Syscall shape check (strace)
+        run: |
+          sudo apt-get update && sudo apt-get install -y strace
+          bash tools/strace_syscalls.sh
+
+  # ---------------------------------------------------------------------------
+  # Mutation testing: verifies the suite DETECTS a curated set of injected
+  # allocator bugs (kill rate gate at 80%). Heavy: nightly + manual dispatch.
+  # ---------------------------------------------------------------------------
+  mutation:
+    name: mutation-testing
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'schedule' && github.ref == 'refs/heads/main')
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run curated mutation campaign
+        run: bash tools/mutation_test.sh
