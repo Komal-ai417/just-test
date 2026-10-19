@@ -41,13 +41,13 @@ Slab* Slab::Create(void* memory, std::size_t memory_size, std::size_t block_size
 #endif
 
     // Determine the offset for user blocks perfectly aligned
-    std::size_t offset = (sizeof(Slab) + ALIGNMENT - 1) & ~(ALIGNMENT - 1);
+    std::size_t const offset = (sizeof(Slab) + ALIGNMENT - 1) & ~(ALIGNMENT - 1);
 
     if (memory_size < offset + block_size) {
         return nullptr;
     }
 
-    std::size_t available_memory = memory_size - offset;
+    std::size_t const available_memory = memory_size - offset;
 
     slab->total_blocks = available_memory / block_size;
     slab->free_blocks = slab->total_blocks;

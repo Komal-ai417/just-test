@@ -18,20 +18,49 @@
 #   * OOM countdown not decremented         (permanent OOM after injection)
 #   * aligned-alloc stash offset shifted    (provenance corruption)
 #
-# Usage: bash tools/mutation_test.sh [--full]
+# Usage: bash tools/mutation_test.sh [--full] [--only m01,m04,...]
 #   default: fast subset (api/size-class/slab/page-cache/realloc suites)
 #   --full:  full validate suite per mutant (much slower)
+#   --only:  comma-separated subset of mutant ids (smoke runs / debugging)
 # ============================================================================
 set -uo pipefail
 cd "$(dirname "$0")/.."
 command -v cmake > /dev/null || { echo "cmake required" >&2; exit 2; }
 
 FULL=0
-[ "${1:-}" = "--full" ] && FULL=1
-WORK="${BUILD_DIR:-build-mutation}/mutation-work"
-mkdir -p "$(dirname "$WORK")"
-rm -rf "$WORK"
-mkdir -p "$WORK"
+ONLY=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --full) FULL=1 ;;
+        --only) ONLY="${2:-}"; shift ;;
+        *) echo "unknown option: $1" >&2; exit 2 ;;
+    esac
+    shift
+done
+WORK_REL="${BUILD_DIR:-build-mutation}/mutation-work"
+mkdir -p "$(dirname "$WORK_REL")"
+rm -rf "$WORK_REL"
+mkdir -p "$WORK_REL"
+# Absolutize: FETCHCONTENT_SOURCE_DIR_GOOGLETEST below must be an absolute
+# path - cmake resolves relative values against each mutant's source tree,
+# where they point at a nonexistent location.
+WORK="$(cd "$WORK_REL" && pwd)"
+# Shared googletest source for all mutants: fetched/cloned exactly once for
+# the whole campaign instead of once per mutant (the CMake FetchContent
+# declaration would otherwise clone v1.14.0 ten times). Only the SOURCE is
+# shared - each mutant still compiles gtest into its own build tree, so no
+# cross-mutant build-flag contamination. Living under $WORK (i.e. under
+# build-mutation/) also keeps it out of the per-mutant tar copies.
+FETCH_CACHE="$WORK/fetchcache"
+GTEST_TAG=$(sed -n 's/.*GIT_TAG[[:space:]]\+\(v[0-9.][0-9.]*\).*/\1/p' CMakeLists.txt | head -1)
+GTEST_SRC="$FETCH_CACHE/googletest-src"
+if [ ! -d "$GTEST_SRC" ]; then
+    mkdir -p "$FETCH_CACHE"
+    git clone --depth 1 -b "${GTEST_TAG:-v1.14.0}" \
+        https://github.com/google/googletest.git "$GTEST_SRC" >/dev/null 2>&1
+fi
+GTEST_CACHE_ARG=()
+[ -d "$GTEST_SRC" ] && GTEST_CACHE_ARG=("-DFETCHCONTENT_SOURCE_DIR_GOOGLETEST=$GTEST_SRC")
 
 # mutant_id|file|sed-expression|description
 MUTANTS=(
@@ -40,9 +69,9 @@ MUTANTS=(
   'm03|src/tls_cache.h|s/if (FAST_UNLIKELY(bin.head == block))/if (false)/|double-push guard disabled (double free accepted)'
   'm04|src/tls_cache.cpp|s/if (bins_\[i\].count <= kDeferMaxBin)/if (false)/|thread-exit deferred hand-off disabled (pending queue starved)'
   'm05|src/global_heap.cpp|s/DrainPendingReturns(a, c);//|purge skips pending drain (retention leak)'
-  'm06|src/global_heap.cpp|s/std::size_t rem_pages = p - pages;/std::size_t rem_pages = 0;/|page-cache split loses the tail span'
+  'm06|src/global_heap.cpp|s/std::size_t const rem_pages = p - pages;/std::size_t const rem_pages = 0;/|page-cache split loses the tail span'
   'm07|src/global_heap.cpp|s/if (FAST_UNLIKELY(ShouldFailAllocationForTest()))/if (false)/|OOM injection disabled (OOM tests fail cleanly)'
-  'm08|src/fast_alloc.cpp|s/std::size_t raw_size = size + alignment + 32;/std::size_t raw_size = size + alignment + 8;/|aligned stash slack too small (user data trims the red zone)'
+  'm08|src/fast_alloc.cpp|s/std::size_t const raw_size = size + alignment + 32;/std::size_t const raw_size = size + alignment + 8;/|aligned stash slack too small (user data trims the red zone)'
   'm09|src/tls_cache.cpp|s/bin.count -= static_cast<uint32_t>(batch_size);/bin.count -= static_cast<uint32_t>(batch_size + 1);/|TLS flush count off-by-one (list/count divergence)'
   'm10|src/fast_alloc.cpp|s/if (!debug_check::FrontCanaryOk(\&block->canary))/if (false)/|front canary check disabled (underflow accepted)'
 )
@@ -60,11 +89,16 @@ report="$WORK/report.txt"
 
 for m in "${MUTANTS[@]}"; do
     IFS='|' read -r mid file expr desc <<< "$m"
+    # --only: comma-separated subset filter (",m01," pattern match keeps
+    # the ids unambiguous - m1 does not match m10).
+    if [ -n "$ONLY" ] && [[ ",$ONLY," != *",$mid,"* ]]; then
+        continue
+    fi
     total=$((total + 1))
     echo "--- mutant $mid: $desc"
     mkdir -p "$WORK/$mid"
     # Copy the source tree without build dirs and git metadata.
-    tar --exclude='./build*' --exclude='./.git' --exclude="./$WORK" \
+    tar --exclude='./build*' --exclude='./.git' --exclude="./$WORK_REL" \
         -cf - . | (cd "$WORK/$mid" && tar -xf -)
     (cd "$WORK/$mid" && sed -i "$expr" "$file") || { echo "    sed failed"; errored=$((errored+1)); continue; }
     # A sed that matches nothing silently leaves the tree unmutated; require
@@ -85,7 +119,8 @@ for m in "${MUTANTS[@]}"; do
         *)   CFG=""; MFILTER="$FILTER" ;;
     esac
     if ! (cd "$WORK/$mid" && cmake -S . -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo \
-              $CFG -DFASTALLOC_BUILD_BENCHMARKS=OFF > /dev/null 2>&1); then
+              $CFG -DFASTALLOC_BUILD_BENCHMARKS=OFF \
+              "${GTEST_CACHE_ARG[@]}" > /dev/null 2>&1); then
         echo "    RESULT: REJECTED AT BUILD (counts as killed: code path is load-bearing)"
         killed=$((killed + 1)); echo "$mid KILLED(build) $desc" >> "$report"; continue
     fi

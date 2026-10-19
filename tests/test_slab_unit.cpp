@@ -214,7 +214,7 @@ TEST(SlabUnit, InterleavedAllocateDeallocateStaysConsistent) {
         // Invariant: free bookkeeping always matches the live set.
         EXPECT_EQ(slab->free_blocks + live.size(), slab->total_blocks);
     }
-    for (auto& b : live) slab->Deallocate(b.first);
+    for (const auto& b : live) slab->Deallocate(b.first);
     EXPECT_TRUE(slab->IsEmpty());
 }
 

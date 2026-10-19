@@ -68,8 +68,11 @@ Obs RunStream(unsigned seed, std::size_t ops, M malloc_fn, F free_fn,
             std::size_t s = 1 + rng() % 4096;
             void* p = aligned_fn(al, s);
             o.outcomes.push_back(p ? 1 : 0);
-            if (p) o.align_ok.push_back((reinterpret_cast<uintptr_t>(p) & (al - 1)) == 0);
-            if (p) { std::memset(p, 0xAB, s); live.push_back({p, s}); }
+            if (p) {
+                o.align_ok.push_back((reinterpret_cast<uintptr_t>(p) & (al - 1)) == 0);
+                std::memset(p, 0xAB, s);
+                live.push_back({p, s});
+            }
         } else {
             std::size_t idx = rng() % live.size();
             free_fn(live[idx].first);
@@ -300,7 +303,7 @@ TEST(AuditMemory, ReadAfterFreeDoesNotCrash) {
         ASSERT_NE(p, nullptr);
         std::memset(p, 0x66, s);
         fast_free(p);
-        auto* c = static_cast<volatile unsigned char*>(p);
+        auto* c = static_cast<volatile const unsigned char*>(p);
         (void)c[0]; (void)c[s / 2]; (void)c[s - 1];   // must not fault
     }
     SUCCEED();

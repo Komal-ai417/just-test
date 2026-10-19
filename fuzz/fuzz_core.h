@@ -32,6 +32,8 @@
 #include <cstdint>
 #include <vector>
 #include <unordered_map>
+#include <algorithm>
+#include <numeric>
 
 namespace fuzzcore {
 
@@ -71,9 +73,9 @@ public:
         return static_cast<const unsigned char*>(p)[0] == it->second.fill;
     }
     std::size_t bytes_live() const {
-        std::size_t s = 0;
-        for (auto& kv : live) s += kv.second.size;
-        return s;
+        return std::accumulate(
+            live.begin(), live.end(), std::size_t{0},
+            [](std::size_t s, const auto& kv) { return s + kv.second.size; });
     }
 };
 
@@ -146,8 +148,9 @@ inline bool RunProgram(const uint8_t* data, std::size_t size, Shadow& shadow,
                 }
                 order.push_back(p);
                 st.aligned++;
-            } else if (al >= 4096 && sz > 0) {
-                // valid alignment+size must not fail except under real OOM
+            } else if (al >= 4096) {
+                // valid alignment must not fail except under real OOM
+                // (sz is built as 1 + arg*97 above, so it is never 0)
                 st.aligned++;  // counted anyway; nullptr only under OOM
             }
             break;
@@ -277,11 +280,13 @@ inline bool RunProgram(const uint8_t* data, std::size_t size, Shadow& shadow,
         }
     }
     // End-of-input invariant: every live block's marker survives
-    for (auto& kv : shadow.live) {
-        if (static_cast<const unsigned char*>(kv.first)[0] != kv.second.fill) {
-            std::fprintf(stderr, "[FUZZ INVARIANT] live marker destroyed at end-of-input\n");
-            return false;
-        }
+    const bool markers_ok = std::all_of(
+        shadow.live.begin(), shadow.live.end(), [](const auto& kv) {
+            return static_cast<const unsigned char*>(kv.first)[0] == kv.second.fill;
+        });
+    if (!markers_ok) {
+        std::fprintf(stderr, "[FUZZ INVARIANT] live marker destroyed at end-of-input\n");
+        return false;
     }
     if (verbose)
         std::fprintf(stderr,

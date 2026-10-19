@@ -138,8 +138,8 @@ inline void BumpLive(uint64_t n, std::size_t bytes) {
     // Peak maintenance at flush granularity: values are monotone snapshots
     // of the running totals, so peaks can only be under-reported between
     // flushes (documented as approximate in release builds).
-    std::size_t b = g_live_blocks.load(std::memory_order_relaxed);
-    std::size_t by = g_live_bytes.load(std::memory_order_relaxed);
+    std::size_t const b = g_live_blocks.load(std::memory_order_relaxed);
+    std::size_t const by = g_live_bytes.load(std::memory_order_relaxed);
     std::size_t pb = g_peak_live_blocks.load(std::memory_order_relaxed);
     while (b > pb && !g_peak_live_blocks.compare_exchange_weak(pb, b, std::memory_order_relaxed)) {}
     std::size_t pby = g_peak_live_bytes.load(std::memory_order_relaxed);
@@ -223,7 +223,7 @@ inline std::size_t HashPtr(void* p, std::size_t mask) {
     // Fibonacci hashing for pointer values.
     std::uintptr_t v = reinterpret_cast<std::uintptr_t>(p);
     v >>= 4; // blocks are at least 16B aligned; mix the interesting bits
-    return (static_cast<std::size_t>(v) * 0x9E3779B97F4A7C15ull) & mask;
+    return (static_cast<std::size_t>(v) * 0x9E3779B97F4A7C15ULL) & mask;
 }
 
 // Tombstone sentinel for open-addressing deletion (probe-chain safety).
@@ -236,7 +236,7 @@ inline void* Tombstone() { return reinterpret_cast<void*>(kTombstoneBits); }
 constexpr std::size_t kInitialShardCapacity = 1024; // power of two
 } // namespace
 
-std::size_t AllocRegistry::HashShard(void* p) const {
+std::size_t AllocRegistry::HashShard(void* p) {
     return (reinterpret_cast<std::uintptr_t>(p) >> 4) % kShardCount;
 }
 
@@ -255,18 +255,19 @@ AllocRegistry::AllocRegistry() {
 }
 
 AllocRegistry::~AllocRegistry() {
-    for (auto& s : shards_) std::free(s.table);
+    for (auto& s : shards_) { std::free(s.table); }
 }
 
 void AllocRegistry::GrowShard(Shard& shard) {
-    std::size_t new_cap = shard.capacity * 2;
+    std::size_t const new_cap = shard.capacity * 2;
     AllocRecord* nt = static_cast<AllocRecord*>(std::malloc(new_cap * sizeof(AllocRecord)));
-    if (!nt) return; // stay at current capacity; load factor degrades but stays correct
+    if (!nt) { return; // stay at current capacity; load factor degrades but stays correct
+}
     std::memset(nt, 0, new_cap * sizeof(AllocRecord));
     for (std::size_t i = 0; i < shard.capacity; ++i) {
         if (shard.table[i].ptr && !IsTombstone(shard.table[i].ptr)) {
             std::size_t slot = HashPtr(shard.table[i].ptr, new_cap - 1);
-            while (nt[slot].ptr) slot = (slot + 1) & (new_cap - 1);
+            while (nt[slot].ptr) { slot = (slot + 1) & (new_cap - 1); }
             nt[slot] = shard.table[i];
         }
     }
@@ -278,19 +279,19 @@ void AllocRegistry::GrowShard(Shard& shard) {
 
 bool AllocRegistry::Insert(const AllocRecord& rec, AllocRecord* existing) {
     Shard& s = shards_[HashShard(rec.ptr)];
-    std::lock_guard<std::mutex> lock(s.mtx);
+    std::lock_guard<std::mutex> const lock(s.mtx);
 
     // Rehash on high load INCLUDING tombstones: insert/erase churn creates
     // tombstones which would otherwise slow probes indefinitely.
-    if ((s.count + s.tombstones) * 10 >= s.capacity * 7) GrowShard(s);
+    if ((s.count + s.tombstones) * 10 >= s.capacity * 7) { GrowShard(s); }
 
     std::size_t slot = HashPtr(rec.ptr, s.capacity - 1);
     std::size_t first_tombstone = static_cast<std::size_t>(-1);
     while (s.table[slot].ptr) {
         if (IsTombstone(s.table[slot].ptr)) {
-            if (first_tombstone == static_cast<std::size_t>(-1)) first_tombstone = slot;
+            if (first_tombstone == static_cast<std::size_t>(-1)) { first_tombstone = slot; }
         } else if (s.table[slot].ptr == rec.ptr) {
-            if (existing) *existing = s.table[slot];
+            if (existing) { *existing = s.table[slot]; }
             return false; // already live -> double allocation / double free
         }
         slot = (slot + 1) & (s.capacity - 1);
@@ -308,12 +309,12 @@ bool AllocRegistry::Insert(const AllocRecord& rec, AllocRecord* existing) {
 
 bool AllocRegistry::Erase(void* ptr, AllocRecord* out) {
     Shard& s = shards_[HashShard(ptr)];
-    std::lock_guard<std::mutex> lock(s.mtx);
+    std::lock_guard<std::mutex> const lock(s.mtx);
     std::size_t slot = HashPtr(ptr, s.capacity - 1);
     while (s.table[slot].ptr) {
         if (!IsTombstone(s.table[slot].ptr) && s.table[slot].ptr == ptr) {
-            if (out) *out = s.table[slot];
-            if (s.live_bytes >= s.table[slot].size) s.live_bytes -= s.table[slot].size;
+            if (out) { *out = s.table[slot]; }
+            if (s.live_bytes >= s.table[slot].size) { s.live_bytes -= s.table[slot].size; }
             // Tombstone (not nullptr!) keeps probe chains intact: a later
             // lookup for an entry placed beyond this slot must still scan on.
             s.table[slot].ptr = Tombstone();
@@ -328,30 +329,30 @@ bool AllocRegistry::Erase(void* ptr, AllocRecord* out) {
 
 std::size_t AllocRegistry::live_count() const {
     std::size_t n = 0;
-    for (auto& s : shards_) { std::lock_guard<std::mutex> lock(s.mtx); n += s.count; }
+    for (const auto& s : shards_) { std::lock_guard<std::mutex> const lock(s.mtx); n += s.count; }
     return n;
 }
 
 std::size_t AllocRegistry::live_bytes() const {
     std::size_t n = 0;
-    for (auto& s : shards_) { std::lock_guard<std::mutex> lock(s.mtx); n += s.live_bytes; }
+    for (const auto& s : shards_) { std::lock_guard<std::mutex> const lock(s.mtx); n += s.live_bytes; }
     return n;
 }
 
 void AllocRegistry::DumpLeaks() {
     (void)std::fprintf(stderr, "\n================ FastAlloc LEAK REPORT ================\n");
-    std::size_t total = 0, total_bytes = 0;
-    for (std::size_t si = 0; si < kShardCount; ++si) {
-        Shard& s = const_cast<Shard&>(shards_[si]);
-        std::lock_guard<std::mutex> lock(s.mtx);
+    std::size_t total = 0;
+    std::size_t total_bytes = 0;
+    for (auto& s : shards_) {
+        std::lock_guard<std::mutex> const lock(s.mtx);
         for (std::size_t i = 0; i < s.capacity; ++i) {
-            if (!s.table[i].ptr || IsTombstone(s.table[i].ptr)) continue;
+            if (!s.table[i].ptr || IsTombstone(s.table[i].ptr)) { continue; }
             ++total;
             total_bytes += s.table[i].size;
             (void)std::fprintf(stderr,
                 "  LEAK ptr=%p size=%zu (usable=%zu) class=%s seq=%zu tid=%llu\n",
                 s.table[i].ptr, s.table[i].size, s.table[i].usable,
-                s.table[i].class_or_large == 0xFFFFFFFFu ? "LARGE" : "small",
+                s.table[i].class_or_large == 0xFFFFFFFFU ? "LARGE" : "small",
                 s.table[i].sequence,
                 static_cast<unsigned long long>(s.table[i].thread_id));
         }
@@ -366,7 +367,7 @@ void AllocRegistry::DumpLeaks() {
 
 void AllocRegistry::ResetForTesting() {
     for (auto& s : shards_) {
-        std::lock_guard<std::mutex> lock(s.mtx);
+        std::lock_guard<std::mutex> const lock(s.mtx);
         std::memset(s.table, 0, s.capacity * sizeof(AllocRecord));
         s.count = 0;
         s.tombstones = 0;
@@ -415,7 +416,7 @@ const char* ViolationKindName(Violation kind) {
     }
 #if FASTALLOC_HAVE_BACKTRACE
     void* frames[32];
-    int n = backtrace(frames, 32);
+    int const n = backtrace(frames, 32);
     if (n > 0) {
         (void)std::fprintf(stderr, "    backtrace:\n");
         backtrace_symbols_fd(frames, n, 2);

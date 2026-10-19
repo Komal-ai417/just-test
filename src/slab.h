@@ -71,7 +71,7 @@ struct Slab {
      * @brief Allocates an object from this slab.
      * @return Pointer to object, or nullptr if slab is full.
      */
-    inline void* Allocate() {
+    void* Allocate() {
 #if FASTALLOC_DEBUG_ENABLED
         // Invariant check: verify free blocks available.
         assert_fast(free_blocks > 0 && (free_list != nullptr || next_new < total_blocks),
@@ -86,7 +86,7 @@ struct Slab {
         if (FAST_LIKELY(next_new < total_blocks)) {
             // Carve the next virgin block (release lazy wiring).
             FreeBlock* block = reinterpret_cast<FreeBlock*>(
-                reinterpret_cast<char*>(this) + first_block_offset + next_new * block_size);
+                reinterpret_cast<char*>(this) + first_block_offset + (next_new * block_size));
             block->slab = this;
             block->class_index = class_idx;
             block->canary = 0;
@@ -101,7 +101,7 @@ struct Slab {
      * @brief Returns an object to this slab's free list.
      * @param ptr The pointer to return.
      */
-    inline void Deallocate(void* ptr) {
+    void Deallocate(void* ptr) {
         FreeBlock* block = static_cast<FreeBlock*>(ptr);
 #if FASTALLOC_DEBUG_ENABLED
         assert_fast(block->slab == this, "Block returned to wrong slab");

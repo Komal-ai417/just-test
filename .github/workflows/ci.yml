@@ -5,6 +5,11 @@ on:
     branches: [ main ]
   pull_request:
     branches: [ main ]
+  schedule:
+    # Nightly full pass on the default branch (keeps the schedule-restricted
+    # job guards below reachable; without this trigger those conditions
+    # could never evaluate true).
+    - cron: "0 3 * * *"
   workflow_dispatch:
 
 jobs:
@@ -904,19 +909,24 @@ jobs:
         run: bash tools/msan_check.sh
 
   # ---------------------------------------------------------------------------
-  # Valgrind memcheck: independent second opinion on memory errors
-  # (invalid reads/writes/frees, leaks) for both gtest suites.
+  # Valgrind: memcheck on both gtest suites (invalid reads/writes/frees,
+  # leaks) plus a cachegrind cache-behaviour profile of a bench_suite
+  # workload (L1 I/D + LL miss ratios, hottest lines). The memcheck log
+  # streams live to the console (tee'd) so a hang or slow test is visible
+  # in real time instead of only as a post-mortem summary.
   # ---------------------------------------------------------------------------
   valgrind:
-    name: valgrind-memcheck
+    name: valgrind-memcheck-cachegrind
     runs-on: ubuntu-latest
-    timeout-minutes: 50
+    timeout-minutes: 70
     steps:
       - uses: actions/checkout@v4
       - name: Install valgrind
         run: sudo apt-get update && sudo apt-get install -y valgrind
-      - name: Memcheck both suites
+      - name: Memcheck both suites (live-streamed log)
         run: bash tools/valgrind_memcheck.sh
+      - name: Cachegrind cache profile
+        run: bash tools/valgrind_cachegrind.sh
 
   # ---------------------------------------------------------------------------
   # Tool-script checks that run on plain CI hardware: environment tunables
@@ -938,12 +948,17 @@ jobs:
 
   # ---------------------------------------------------------------------------
   # Mutation testing: verifies the suite DETECTS a curated set of injected
-  # allocator bugs (kill rate gate at 80%). Heavy: nightly + manual dispatch.
+  # allocator bugs (kill rate gate at 80%). Runs on every push to main and
+  # every PR, plus nightly and manual dispatch — the earlier guard limited
+  # it to workflow_dispatch/schedule while no schedule trigger existed, so
+  # the job showed up as "skipped" on every single push.
   # ---------------------------------------------------------------------------
   mutation:
     name: mutation-testing
     if: >-
       github.event_name == 'workflow_dispatch' ||
+      github.event_name == 'push' ||
+      github.event_name == 'pull_request' ||
       (github.event_name == 'schedule' && github.ref == 'refs/heads/main')
     runs-on: ubuntu-latest
     timeout-minutes: 90
@@ -951,3 +966,10 @@ jobs:
       - uses: actions/checkout@v4
       - name: Run curated mutation campaign
         run: bash tools/mutation_test.sh
+      - name: Upload mutation report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mutation-report
+          path: build-mutation/mutation-work/report.txt
+          if-no-files-found: ignore

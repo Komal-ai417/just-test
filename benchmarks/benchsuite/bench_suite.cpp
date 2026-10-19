@@ -176,7 +176,7 @@ static inline void tag_store(void* p, std::size_t sz, uint64_t tag) {
         unsigned char b[8]; std::memcpy(b, &tag, 8); std::memcpy(p, b, sz);
     }
 }
-static inline bool tag_verify(void* p, std::size_t sz, uint64_t tag) {
+static inline bool tag_verify(const void* p, std::size_t sz, uint64_t tag) {
     if (!p) return false;
     if (sz >= 8) { uint64_t v; std::memcpy(&v, p, 8); return v == tag; }
     if (sz > 0) {
@@ -186,9 +186,9 @@ static inline bool tag_verify(void* p, std::size_t sz, uint64_t tag) {
     }
     return true;
 }
-static inline void sink_ptr(void* p) {
+static inline void sink_ptr(const void* p) {
 #if defined(_MSC_VER)
-    static void* volatile s_sink; s_sink = p;
+    static const void* volatile s_sink; s_sink = p;
 #else
     asm volatile("" :: "r"(p) : "memory");
 #endif
@@ -554,7 +554,7 @@ static void churn_teardown(ChurnCtx& ctx, int threads) {
     for (int t = 0; t < threads; ++t) {
         uint64_t tag_base = (uint64_t)t << 48;
         void** my_slots  = &ctx.slots[(size_t)t * Wp];
-        uint32_t* my_sizes = &ctx.sizes[(size_t)t * Wp];
+        const uint32_t* my_sizes = &ctx.sizes[(size_t)t * Wp];
         for (size_t i = 0; i < Wp; ++i) {
             void* p = my_slots[i];
             if (p) {
@@ -595,11 +595,6 @@ struct SpscRing {
     uint64_t size_approx() const {
         return tail.load(std::memory_order_acquire) - head.load(std::memory_order_acquire);
     }
-};
-
-struct MpmpcCtx {
-    std::vector<SpscRing*> rings;
-    std::atomic<uint32_t> bad_tags{0};
 };
 
 static RepResult run_cross_thread(int threads, uint64_t ops) {
@@ -1181,7 +1176,8 @@ int main(int argc, char** argv) {
     if (!results.empty()) {
         std::vector<double> v;
         v.reserve(results.size());
-        for (const auto& r : results) v.push_back(r.ns_per_op);
+        std::transform(results.begin(), results.end(), std::back_inserter(v),
+                       [](const RepResult& r) { return r.ns_per_op; });
         std::sort(v.begin(), v.end());
         double med = v[v.size() / 2];
         std::printf("--- %s | %s | T=%d : median %.2f ns/op (%.1f M ops/s) | checksum %s ---\n",

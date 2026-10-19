@@ -264,9 +264,9 @@ TEST(DebugPoison, FrontCanaryValue) {
 namespace {
 class StderrRedirect {
 public:
-    StderrRedirect() {
-        path_ = std::string("/tmp/fastalloc_log_test_") +
-                std::to_string(static_cast<long>(::getpid())) + ".err";
+    StderrRedirect()
+        : path_(std::string("/tmp/fastalloc_log_test_") +
+                std::to_string(static_cast<long>(::getpid())) + ".err") {
         fflush(stderr);
         saved_ = dup(2);
         file_ = freopen(path_.c_str(), "w", stderr);

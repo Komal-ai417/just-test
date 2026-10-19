@@ -14,6 +14,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <cmath>
+#include <numeric>
 #include <string>
 #include <thread>
 #include <vector>
@@ -95,8 +96,7 @@ static RepStats Summarize(std::vector<double>& xs) {
 static void PrintPct(const char* tag, std::vector<double>& lat) {
     std::sort(lat.begin(), lat.end());
     auto q = [&](double p) { return lat[static_cast<std::size_t>(p * (lat.size() - 1))]; };
-    double s = 0;
-    for (double x : lat) s += x;
+    const double s = std::accumulate(lat.begin(), lat.end(), 0.0);
     std::printf("  %-14s n=%zu mean=%7.1fns p50=%7.1f p90=%7.1f p99=%7.1f p99.9=%8.1f max=%9.1f\n",
                 tag, lat.size(), s / lat.size(), q(0.50), q(0.90), q(0.99), q(0.999), lat.back());
 }

@@ -183,7 +183,7 @@ TEST(PageCache, MixedSizesInterleaveWithoutAddressOverlap) {
         ASSERT_NE(p, nullptr);
         std::memset(p, static_cast<int>(round) & 0xFF, std::min<std::size_t>(sz, 64));
         // Overlap check against every live span (bounded set).
-        for (auto& kv : live) {
+        for (const auto& kv : live) {
             bool disjoint =
                 static_cast<char*>(p) + sz <= kv.first ||
                 static_cast<char*>(kv.first) + kv.second <= p;
@@ -196,6 +196,6 @@ TEST(PageCache, MixedSizesInterleaveWithoutAddressOverlap) {
             live.erase(live.begin());
         }
     }
-    for (auto& kv : live) fast_free(kv.first);
+    for (const auto& kv : live) fast_free(kv.first);
     ResetCaches();
 }

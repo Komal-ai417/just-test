@@ -60,7 +60,7 @@ TEST(AuditSlab, SlabExhaustionAndNewSlabPerClass) {
         // one batch; the per-op ASSERT_NE above is the exact serviceability check.
         EXPECT_GE(mid.small_allocs + 256, before.small_allocs + hold.size())
             << "class " << c << ": requests not served beyond batch slack";
-        for (void* p : hold) EXPECT_TRUE(Verify(p, req, 0x9A + c));
+        for (const void* p : hold) EXPECT_TRUE(Verify(p, req, 0x9A + c));
         // partially free: every other block -> partially occupied slabs
         for (std::size_t i = 0; i < hold.size(); i += 2) fast_free(hold[i]);
         // allocate again: must reuse (page-cache/slab freelist), not leak

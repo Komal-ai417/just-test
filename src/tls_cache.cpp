@@ -2,6 +2,7 @@
 #include "global_heap.h"
 #include "os_memory.h"
 #include "debug_aid.h"
+#include <algorithm>
 #include <atomic>
 #include <cstdlib>
 #include <cstdio>
@@ -36,7 +37,7 @@ void PrintInvariantEvent(const char* kind, std::size_t class_index,
 } // namespace
 
 void ReportDoublePushGuard() {
-    std::uint64_t n =
+    std::uint64_t const n =
         g_double_push_guard_hits.fetch_add(1, std::memory_order_relaxed) + 1;
     if (n == 1) {
         PrintInvariantEvent("double-push guard", 0, 0, 0);
@@ -52,7 +53,7 @@ void ReportBinHeadCorruption(std::size_t class_index, std::uintptr_t bad_head) {
                      "head=%#zx (< 64 KB; never a FastAlloc block). Bin "
                      "re-derived from a fresh batch, allocator state "
                      "protected.\n",
-                     class_index, bad_head);
+                     class_index, static_cast<std::size_t>(bad_head));
         (void)std::fflush(stderr);
     }
 }
@@ -66,7 +67,7 @@ void ReportWildFreelistLink(const char* where, std::size_t class_index,
                      "[fastalloc-invariant] wild freelist value at %s: "
                      "class=%zu value=%#zx (fails <64KB / <2^47 / 16-aligned "
                      "plausibility). Dropped, allocator state protected.\n",
-                     where, class_index, bad_link);
+                     where, class_index, static_cast<std::size_t>(bad_link));
         (void)std::fflush(stderr);
     }
 }
@@ -98,7 +99,7 @@ struct CachePool {
         int spins = 0;
         while (lock.test_and_set(std::memory_order_acquire)) {
             if (++spins > 64) { std::this_thread::yield(); spins = 0; }
-            else FAST_CPU_PAUSE();
+            else { FAST_CPU_PAUSE(); }
         }
         if (count.load(std::memory_order_relaxed) < kCachePoolCap) {
             slots[count.load(std::memory_order_relaxed)] = c;
@@ -106,21 +107,22 @@ struct CachePool {
             lock.clear(std::memory_order_release);
         } else {
             lock.clear(std::memory_order_release);
-            std::size_t page_size = OSMemory::GetPageSize();
-            std::size_t alloc_size = (sizeof(TLSCache) + page_size - 1) & ~(page_size - 1);
+            std::size_t const page_size = OSMemory::GetPageSize();
+            std::size_t const alloc_size = (sizeof(TLSCache) + page_size - 1) & ~(page_size - 1);
             OSMemory::FreePages(c, alloc_size);
         }
     }
 
     TLSCache* Pop() {
-        if (count.load(std::memory_order_relaxed) == 0) return nullptr; // hint, racy-safe
+        if (count.load(std::memory_order_relaxed) == 0) { return nullptr; // hint, racy-safe
+}
         TLSCache* c = nullptr;
         int spins = 0;
         while (lock.test_and_set(std::memory_order_acquire)) {
             if (++spins > 64) { std::this_thread::yield(); spins = 0; }
-            else FAST_CPU_PAUSE();
+            else { FAST_CPU_PAUSE(); }
         }
-        std::size_t n = count.load(std::memory_order_relaxed);
+        std::size_t const n = count.load(std::memory_order_relaxed);
         if (n > 0) {
             c = slots[n - 1];
             count.store(n - 1, std::memory_order_relaxed);
@@ -143,8 +145,8 @@ void RecycleOrFreeCache(TLSCache* cache, bool flushed_ok) {
         CachePoolInstance().Push(cache);
         return;
     }
-    std::size_t page_size = OSMemory::GetPageSize();
-    std::size_t alloc_size = (sizeof(TLSCache) + page_size - 1) & ~(page_size - 1);
+    std::size_t const page_size = OSMemory::GetPageSize();
+    std::size_t const alloc_size = (sizeof(TLSCache) + page_size - 1) & ~(page_size - 1);
     OSMemory::FreePages(cache, alloc_size);
 }
 
@@ -187,7 +189,7 @@ pthread_key_t TLSCache::tls_key_;
 void TLSCache::TlsDestructor(void* ptr) {
     if (ptr) {
         TLSCache* cache = static_cast<TLSCache*>(ptr);
-        bool process_exiting = GlobalHeap::GetInstance().IsShuttingDown();
+        bool const process_exiting = GlobalHeap::GetInstance().IsShuttingDown();
         bool flushed_ok = true;
         if (!process_exiting) {
             cache->~TLSCache(); // flush cached blocks back to the global heap
@@ -201,7 +203,7 @@ void TLSCache::TlsDestructor(void* ptr) {
 }
 
 void TLSCache::InitTlsKey() {
-    int rc = pthread_key_create(&tls_key_, TlsDestructor);
+    int const rc = pthread_key_create(&tls_key_, TlsDestructor);
     if (rc != 0) {
         // tls_key_ may hold a stale/foreign value here; a zero-initialized
         // key is a valid key number that can belong to another library, and
@@ -215,16 +217,15 @@ void TLSCache::InitTlsKey() {
 }
 #endif
 
-TLSCache::TLSCache() {
-    arena_index_ = GlobalHeap::GetInstance().GetNextArena();
+TLSCache::TLSCache() : arena_index_(GlobalHeap::GetInstance().GetNextArena()) {
     stats::CountTlsCreate();
 #if FASTALLOC_LOGGING_ENABLED
-    LogEvent(LogLevel::Debug, "tls-create", "cache=%p arena=%u", (void*)this, arena_index_);
+    LogEvent(LogLevel::Debug, "tls-create", "cache=%p arena=%u", static_cast<const void*>(this), arena_index_);
 #endif
 }
 
 TLSCache& TLSCache::GetSlow() {
-    static bool key_init = [] { InitTlsKey(); return true; }();
+    static bool const key_init = [] { InitTlsKey(); return true; }();
     (void)key_init;
 
 #ifdef _WIN32
@@ -258,17 +259,17 @@ TLSCache& TLSCache::GetSlow() {
         fast_path_cache = static_cast<TLSCache*>(val);
         return *fast_path_cache;
     }
-    std::size_t page_size = OSMemory::GetPageSize();
-    std::size_t alloc_size = (sizeof(TLSCache) + page_size - 1) & ~(page_size - 1);
+    std::size_t const page_size = OSMemory::GetPageSize();
+    std::size_t const alloc_size = (sizeof(TLSCache) + page_size - 1) & ~(page_size - 1);
     // Recycle a retired cache when possible: no mmap, no first-touch faults.
     void* mem = CachePoolInstance().Pop();
-    if (!mem) mem = OSMemory::AllocatePages(alloc_size);
+    if (!mem) { mem = OSMemory::AllocatePages(alloc_size); }
     if (FAST_UNLIKELY(!mem)) {
         (void)std::fprintf(stderr, "FastAlloc FATAL: cannot mmap memory for thread cache - aborting.\n");
         std::abort();
     }
     TLSCache* cache = new (mem) TLSCache();
-    int rc = pthread_setspecific(tls_key_, cache);
+    int const rc = pthread_setspecific(tls_key_, cache);
     if (FAST_UNLIKELY(rc != 0)) {
         // Degrade gracefully: this thread keeps a working cache through
         // fast_path_cache, but the destructor will never run - log it.
@@ -287,7 +288,7 @@ TLSCache::~TLSCache() {
 }
 
 void TLSCache::FlushStats() {
-    if (stats_.ops == 0) return;
+    if (stats_.ops == 0) { return; }
     stats::CountSmallAlloc(stats_.small_allocs, stats_.small_alloc_bytes);
     stats::CountSmallFree(stats_.small_frees, stats_.small_free_bytes);
     stats::CountLargeAlloc(stats_.large_allocs, stats_.large_alloc_bytes);
@@ -337,7 +338,7 @@ void TLSCache::FlushToGlobalHeap() {
         LargeFreeEntry* entry = large_free_bins_[i];
         while (entry) {
             LargeFreeEntry* next = entry->next;
-            GlobalHeap::GetInstance().DeallocateLarge(entry, entry->alloc_size);
+            GlobalHeap::DeallocateLarge(entry, entry->alloc_size);
             entry = next;
         }
         large_free_bins_[i] = nullptr;
@@ -364,22 +365,23 @@ void TLSCache::AuditBin(std::size_t class_index) const {
 
 void* TLSCache::AllocateBlockSlow(std::size_t class_index) {
     stats::CountTlsMisses();
-    std::size_t max_cache = CACHE_LIMITS[class_index];
+    std::size_t const max_cache = CACHE_LIMITS[class_index];
 
     // Adaptive refill: start at initial refill target and double on consecutive misses, capped at max_cache/2.
     CacheBin& bin = bins_[class_index];
     std::size_t target_count = bin.next_refill;
-    if (target_count == 0) target_count = 16; // kInitialRefill
+    if (target_count == 0) { target_count = 16; // kInitialRefill
+}
     std::size_t hard_cap = max_cache / 2;
-    if (hard_cap == 0) hard_cap = 1;
-    if (target_count > hard_cap) target_count = hard_cap;
+    if (hard_cap == 0) { hard_cap = 1; }
+    target_count = std::min(target_count, hard_cap);
     bin.next_refill = static_cast<uint32_t>(
             (target_count * 2 <= hard_cap) ? target_count * 2 : hard_cap);
 
     std::size_t actual_count = 0;
     FreeBlock* batch_head = GlobalHeap::GetInstance().AllocateBatch(class_index, target_count, actual_count, arena_index_);
 
-    if (!batch_head) return nullptr;
+    if (!batch_head) { return nullptr; }
 
     // Verify batch head plausibility before dereferencing.
     if (FAST_UNLIKELY(!IsPlausibleHeapPtr(batch_head))) {
@@ -405,7 +407,7 @@ void* TLSCache::AllocateBlockSlow(std::size_t class_index) {
         ReportWildFreelistLink("AllocateBlockSlow(pop rest)", class_index,
                                reinterpret_cast<std::uintptr_t>(rest));
         rest = nullptr;
-        if (actual_count > 1) actual_count = 1;
+        actual_count = std::min<std::size_t>(actual_count, 1);
     }
     bins_[class_index].head = rest;
     bins_[class_index].count = static_cast<uint32_t>(actual_count - 1);
@@ -414,9 +416,9 @@ void* TLSCache::AllocateBlockSlow(std::size_t class_index) {
 }
 
 void TLSCache::DeallocateBlockSlow(std::size_t class_index) {
-    std::size_t max_cache = CACHE_LIMITS[class_index];
+    std::size_t const max_cache = CACHE_LIMITS[class_index];
     std::size_t batch_size = max_cache / 2;
-    if (batch_size == 0) batch_size = 1;
+    if (batch_size == 0) { batch_size = 1; }
 
     CacheBin& bin = bins_[class_index];
     FreeBlock* head = bin.head;
@@ -466,7 +468,7 @@ void TLSCache::DeallocateBlockSlow(std::size_t class_index) {
 }
 
 void* TLSCache::AllocateLargeCached(std::size_t size) {
-    std::size_t cls = LargeSizeToClass(size);
+    std::size_t const cls = LargeSizeToClass(size);
     LargeFreeEntry** pp = &large_free_bins_[cls];
     while (*pp) {
         // Validate the entry with the plausibility predicate before dereferencing.
@@ -493,7 +495,7 @@ void* TLSCache::AllocateLargeCached(std::size_t size) {
         pp = &(*pp)->next;
     }
 
-    void* mem = GlobalHeap::GetInstance().AllocateLarge(size);
+    void* mem = GlobalHeap::AllocateLarge(size);
     if (mem) {
         LargeAllocHeader* header = static_cast<LargeAllocHeader*>(mem);
         header->alloc_size = size;
@@ -508,7 +510,7 @@ void* TLSCache::AllocateLargeCached(std::size_t size) {
 }
 
 void TLSCache::DeallocateLargeCached(void* ptr, std::size_t alloc_size) {
-    std::size_t cls = LargeSizeToClass(alloc_size);
+    std::size_t const cls = LargeSizeToClass(alloc_size);
     if (large_counts_[cls] < GetMaxLargeCacheSize(alloc_size)) {
         LargeFreeEntry* entry = reinterpret_cast<LargeFreeEntry*>(ptr);
         entry->alloc_size = alloc_size;
@@ -516,7 +518,7 @@ void TLSCache::DeallocateLargeCached(void* ptr, std::size_t alloc_size) {
         large_free_bins_[cls] = entry;
         large_counts_[cls]++;
     } else {
-        GlobalHeap::GetInstance().DeallocateLarge(ptr, alloc_size);
+        GlobalHeap::DeallocateLarge(ptr, alloc_size);
     }
 }
 
@@ -558,9 +560,9 @@ std::size_t AuditCurrentThreadCache(const void* lo, const void* hi) {
     std::size_t hits = TLSCache::GetFast().AuditPointers(lo, hi);
     // The cross-thread recycling pool: retired TLSCache objects. A pool slot
     // pointing into the audited range means a recycled cache was corrupted.
-    CachePool& pool = CachePoolInstance();
+    CachePool const& pool = CachePoolInstance();
     std::size_t n = pool.count.load(std::memory_order_relaxed);
-    if (n > kCachePoolCap) n = kCachePoolCap;
+    n = std::min(n, kCachePoolCap);
     for (std::size_t i = 0; i < n; ++i) {
         TLSCache* c = pool.slots[i];
         if (reinterpret_cast<std::uintptr_t>(c) >=

@@ -84,6 +84,10 @@ void TestCallocZeroedBeforeWrite() {
     const std::size_t cases[][2] = {{0, 8},   {8, 0},     {1, 1},
                                     {16, 16}, {13, 61},   {64, 64},
                                     {31, 97}, {1, 1 << 20}};
+    // cppcheck 2.17 misreports this loop ("c can be declared as pointer to
+    // const") even though c is already a const reference; keep the explicit
+    // element type for clarity either way.
+    // cppcheck-suppress constVariableReference
     for (const auto& c : cases) {
         unsigned char* p = static_cast<unsigned char*>(fast_calloc(c[0], c[1]));
         HARNESS_CHECK(p != nullptr);
@@ -155,8 +159,10 @@ void TestApiContracts() {
     fast_free_sized(nullptr, 0);  // no-op
     void* c = fast_malloc(64);
     HARNESS_CHECK(c != nullptr);
-    FillImage(static_cast<unsigned char*>(c), 64, 0x31);
-    fast_free_sized(c, 64);       // matching hint
+    if (c) {
+        FillImage(static_cast<unsigned char*>(c), 64, 0x31);
+        fast_free_sized(c, 64);       // matching hint
+    }
     fast_free_sized(a, 0);        // zero-size block, zero hint
     fast_free_sized(b, 999);      // wrong hint must route to the true class
 }
@@ -193,7 +199,7 @@ void TestCrossThreadHandoff() {
     }
     pthread_join(thread, nullptr);
     for (std::size_t i = 0; i < st.count; ++i) {
-        unsigned char* block = static_cast<unsigned char*>(st.blocks[i]);
+        const unsigned char* block = static_cast<const unsigned char*>(st.blocks[i]);
         HARNESS_CHECK(ImageMatches(block, 32, 0x9D));  // parent reads child-written bytes
         void* grown = fast_realloc(st.blocks[i], 8000);
         HARNESS_CHECK(grown != nullptr);

@@ -36,8 +36,8 @@ std::size_t PageCacheTotalLimit() {
         std::size_t mb = 64;
         if (env && *env) {
             char* end = nullptr;
-            long v = std::strtol(env, &end, 10);
-            if (end != env && v > 0) mb = static_cast<std::size_t>(v);
+            long const v = std::strtol(env, &end, 10);
+            if (end != env && v > 0) { mb = static_cast<std::size_t>(v); }
         }
         return mb * 1024 * 1024;
     }();
@@ -62,25 +62,25 @@ std::array<PageBin, MAX_CACHED_PAGES + 1> page_bins_{};
 std::array<std::atomic<std::uint64_t>, (MAX_CACHED_PAGES + 64) / 64> page_nonempty_{};
 
 inline void MarkNonEmpty(std::size_t pages) {
-    page_nonempty_[pages >> 6].fetch_or(1ull << (pages & 63), std::memory_order_relaxed);
+    page_nonempty_[pages >> 6].fetch_or(1ULL << (pages & 63), std::memory_order_relaxed);
 }
 inline void MarkMaybeEmpty(std::size_t pages) {
-    page_nonempty_[pages >> 6].fetch_and(~(1ull << (pages & 63)), std::memory_order_relaxed);
+    page_nonempty_[pages >> 6].fetch_and(~(1ULL << (pages & 63)), std::memory_order_relaxed);
 }
 // Smallest hinted bin index > 'pages', or 0 if none (index 0 is unused).
 inline std::size_t FirstNonEmptyAbove(std::size_t pages) {
-    std::size_t need = pages + 1;
+    std::size_t const need = pages + 1;
     std::size_t w = need >> 6;
-    std::uint64_t word = page_nonempty_[w].load(std::memory_order_relaxed) & (~0ull << (need & 63));
+    std::uint64_t word = page_nonempty_[w].load(std::memory_order_relaxed) & (~0ULL << (need & 63));
     if (word == 0) {
         const std::size_t words = page_nonempty_.size();
         for (++w; w < words; ++w) {
             word = page_nonempty_[w].load(std::memory_order_relaxed);
-            if (word != 0) break;
+            if (word != 0) { break; }
         }
     }
-    if (word == 0) return 0;
-    std::size_t p = (w << 6) + (std::size_t)fast_ctzll(word);
+    if (word == 0) { return 0; }
+    std::size_t const p = (w << 6) + (std::size_t)fast_ctzll(word);
     return (p <= MAX_CACHED_PAGES && p > pages) ? p : 0;
 }
 
@@ -104,9 +104,9 @@ void AcquireBinLock(std::atomic_flag& lock) {
 }
 
 std::size_t BinRetentionCount(std::size_t span_pages) {
-    std::size_t span_size = span_pages * OSMemory::GetPageSize();
-    std::size_t by_size = PAGE_CACHE_PER_BIN_BYTES / span_size;
-    std::size_t cap = by_size < 2 ? 2 : (by_size > 64 ? 64 : by_size);
+    std::size_t const span_size = span_pages * OSMemory::GetPageSize();
+    std::size_t const by_size = PAGE_CACHE_PER_BIN_BYTES / span_size;
+    std::size_t const cap = by_size < 2 ? 2 : (by_size > 64 ? 64 : by_size);
     return cap;
 }
 
@@ -122,17 +122,20 @@ void* PageHeapAllocate(std::size_t size) {
         ReportViolation(info);
     }
 #endif
-    std::size_t pages = size / page_size;
+    std::size_t const pages = size / page_size;
     if (pages <= MAX_CACHED_PAGES && pages > 0) {
         // 1) Exact-size bin (common, cheapest).
         {
+            // page_bins_ has MAX_CACHED_PAGES + 1 slots (index 0 unused), so
+            // pages == MAX_CACHED_PAGES is in bounds; cppcheck misses the "+1".
+            // cppcheck-suppress containerOutOfBounds
             auto& bin = page_bins_[pages];
             AcquireBinLock(bin.lock);
             if (bin.head) {
                 PageNode* node = bin.head;
                 bin.head = node->next;
                 bin.count--;
-                if (!bin.head) MarkMaybeEmpty(pages);
+                if (!bin.head) { MarkMaybeEmpty(pages); }
                 bin.lock.clear(std::memory_order_release);
                 page_cache_total_bytes.fetch_sub(size, std::memory_order_relaxed);
                 stats::CountPageCacheHit();
@@ -155,11 +158,11 @@ void* PageHeapAllocate(std::size_t size) {
                 PageNode* node = bin.head;
                 bin.head = node->next;
                 bin.count--;
-                if (!bin.head) MarkMaybeEmpty(p);
-                std::size_t span_bytes = p * page_size;
+                if (!bin.head) { MarkMaybeEmpty(p); }
+                std::size_t const span_bytes = p * page_size;
                 page_cache_total_bytes.fetch_sub(span_bytes, std::memory_order_relaxed);
 
-                std::size_t rem_pages = p - pages;
+                std::size_t const rem_pages = p - pages;
                 if (rem_pages > 0) {
                     // Internal move: no retention increase (net bytes
                     // already subtracted above; the tail re-enters below).
@@ -203,13 +206,15 @@ void PageHeapFree(void* ptr, std::size_t size) {
         ReportViolation(info);
     }
 #endif
-    std::size_t pages = size / page_size;
+    std::size_t const pages = size / page_size;
     if (pages <= MAX_CACHED_PAGES && pages > 0) {
-        auto& bin = page_bins_[pages];
         // Global high-water mark: never let the whole cache exceed the cap
         // because of this insertion.
-        std::size_t total = page_cache_total_bytes.fetch_add(size, std::memory_order_relaxed) + size;
+        std::size_t const total = page_cache_total_bytes.fetch_add(size, std::memory_order_relaxed) + size;
         if (total <= PageCacheTotalLimit()) {
+            // In-bounds: page_bins_ is sized MAX_CACHED_PAGES + 1 (see decl).
+            // cppcheck-suppress containerOutOfBounds
+            auto& bin = page_bins_[pages];
             AcquireBinLock(bin.lock);
             if (bin.count < BinRetentionCount(pages)) {
                 PageNode* node = static_cast<PageNode*>(ptr);
@@ -233,6 +238,8 @@ std::size_t PurgePageCacheLocked() {
     std::size_t released = 0;
     const std::size_t page_size = OSMemory::GetPageSize();
     for (std::size_t p = 1; p <= MAX_CACHED_PAGES; ++p) {
+        // In-bounds: page_bins_ is sized MAX_CACHED_PAGES + 1 (see decl).
+        // cppcheck-suppress containerOutOfBounds
         auto& bin = page_bins_[p];
         AcquireBinLock(bin.lock);
         PageNode* node = bin.head;
@@ -242,7 +249,7 @@ std::size_t PurgePageCacheLocked() {
         bin.lock.clear(std::memory_order_release);
         while (node) {
             PageNode* next = node->next;
-            std::size_t span_size = p * page_size;
+            std::size_t const span_size = p * page_size;
             OSMemory::FreePages(node, span_size);
             page_cache_total_bytes.fetch_sub(span_size, std::memory_order_relaxed);
             stats::CountPageCacheEvict(span_size);
@@ -290,47 +297,53 @@ bool GlobalHeap::ShouldFailAllocationForTest() {
 // ---------------------------------------------------------------------------
 // Test hooks (declared in tests/fast_alloc_test_hooks.h). External linkage,
 // defined here next to the state they touch. Zero cost when unused.
+// clang-tidy wants these static/anon-namespace because no src/*.cpp TU calls
+// them - but external linkage is the point: the test binaries consume them.
 // ---------------------------------------------------------------------------
-void FastAllocTestSetOOMCountdown(int n) {
+void FastAllocTestSetOOMCountdown(int n) {  // NOLINT(misc-use-internal-linkage)
     g_oom_fail_countdown.store(n, std::memory_order_relaxed);
 }
-int FastAllocTestGetOOMCountdown() {
+int FastAllocTestGetOOMCountdown() {  // NOLINT(misc-use-internal-linkage)
     return g_oom_fail_countdown.load(std::memory_order_relaxed);
 }
-std::size_t FastAllocTestPageCacheBytes() {
+std::size_t FastAllocTestPageCacheBytes() {  // NOLINT(misc-use-internal-linkage)
     return page_cache_total_bytes.load(std::memory_order_relaxed);
 }
-std::size_t FastAllocTestPurgePageCache() {
+std::size_t FastAllocTestPurgePageCache() {  // NOLINT(misc-use-internal-linkage)
     return GlobalHeap::GetInstance().PurgePageCache();
 }
 
-static void PushSlab(Slab*& head, Slab* slab) {
+namespace {
+
+void PushSlab(Slab*& head, Slab* slab) {
     slab->next = head;
     slab->prev = nullptr;
-    if (head) head->prev = slab;
+    if (head) { head->prev = slab; }
     head = slab;
 }
 
-static void RemoveSlab(Slab*& head, Slab* slab) {
-    if (slab->prev) slab->prev->next = slab->next;
-    else head = slab->next;
-    if (slab->next) slab->next->prev = slab->prev;
+void RemoveSlab(Slab*& head, Slab* slab) {
+    if (slab->prev) { slab->prev->next = slab->next;
+    } else { head = slab->next; }
+    if (slab->next) { slab->next->prev = slab->prev; }
     slab->next = nullptr;
     slab->prev = nullptr;
 }
 
+}  // namespace
+
 Slab* GlobalHeap::AllocateNewSlab(std::size_t class_index, uint32_t arena_index) {
-    std::size_t block_size = ClassIndexToSize(class_index);
+    std::size_t const block_size = ClassIndexToSize(class_index);
     std::size_t target_blocks = 256;
-    if (block_size >= 1024) target_blocks = 128;
-    if (block_size >= 4096) target_blocks = 32;
+    if (block_size >= 1024) { target_blocks = 128; }
+    if (block_size >= 4096) { target_blocks = 32; }
 
     std::size_t target_size = block_size * target_blocks;
-    if (target_size < 65536) target_size = 65536;
-    if (target_size > MAX_SLAB_SPAN_BYTES) target_size = MAX_SLAB_SPAN_BYTES;
+    target_size = std::max<std::size_t>(target_size, 65536);
+    target_size = std::min(target_size, MAX_SLAB_SPAN_BYTES);
 
-    std::size_t page_size = OSMemory::GetPageSize();
-    std::size_t memory_size = (target_size + page_size - 1) & ~(page_size - 1);
+    std::size_t const page_size = OSMemory::GetPageSize();
+    std::size_t const memory_size = (target_size + page_size - 1) & ~(page_size - 1);
 
     // OOM injection seam (tests only; zero cost otherwise: one relaxed load).
     if (FAST_UNLIKELY(ShouldFailAllocationForTest())) {
@@ -338,7 +351,7 @@ Slab* GlobalHeap::AllocateNewSlab(std::size_t class_index, uint32_t arena_index)
     }
 
     void* memory = PageHeapAllocate(memory_size);
-    if (!memory) return nullptr;
+    if (!memory) { return nullptr; }
 
     stats::CountOsAlloc(memory_size);
 
@@ -352,7 +365,7 @@ Slab* GlobalHeap::AllocateNewSlab(std::size_t class_index, uint32_t arena_index)
     }
 #if FASTALLOC_LOGGING_ENABLED
     LogEvent(LogLevel::Debug, "slab-create", "slab=%p size=%zu class=%zu arena=%u",
-             (void*)slab, memory_size, class_index, arena_index);
+             static_cast<void*>(slab), memory_size, class_index, arena_index);
 #endif
     return slab;
 }
@@ -369,8 +382,9 @@ namespace {
 // is treated as the end of the list and dropped to prevent corrupt traversals.
 inline bool WalkLinkPlausible(FreeBlock* node, const char* where,
                                std::size_t class_index) {
-    if (node == nullptr) return true; // list end: fine
-    if (IsPlausibleHeapPtr(node)) return true;
+    if (node == nullptr) { return true; // list end: fine
+}
+    if (IsPlausibleHeapPtr(node)) { return true; }
     ReportWildFreelistLink(where, class_index,
                            reinterpret_cast<std::uintptr_t>(node));
     return false;
@@ -394,7 +408,7 @@ inline bool BlockSlabUsable(FreeBlock* node, const char* where,
 } // namespace
 
 void GlobalHeap::ProcessPendingListLocked(uint32_t arena_index, std::size_t class_index, FreeBlock* pending) {
-    if (!pending) return;
+    if (!pending) { return; }
     Arena& arena = arenas_[arena_index];
     while (pending) {
         // Validate node and slab metadata before dereferencing to prevent
@@ -424,7 +438,7 @@ void GlobalHeap::ProcessPendingListLocked(uint32_t arena_index, std::size_t clas
         }
 #endif
 
-        bool was_full = slab->IsFull();
+        bool const was_full = slab->IsFull();
         slab->Deallocate(pending);
 
         if (was_full) {
@@ -434,7 +448,7 @@ void GlobalHeap::ProcessPendingListLocked(uint32_t arena_index, std::size_t clas
 
         if (slab->IsEmpty()) {
             RemoveSlab(arena.partial_slabs_[class_index], slab);
-            std::size_t freed_size = slab->memory_size; // capture BEFORE unmap
+            std::size_t const freed_size = slab->memory_size; // capture BEFORE unmap
             PageHeapFree(slab, freed_size);
             stats::CountOsFree(freed_size);
         }
@@ -444,9 +458,9 @@ void GlobalHeap::ProcessPendingListLocked(uint32_t arena_index, std::size_t clas
 
 void GlobalHeap::DrainPendingReturns(uint32_t arena_index, std::size_t class_index) {
     Arena& arena = arenas_[arena_index];
-    if (arena.pending_returns_[class_index].head.load(std::memory_order_relaxed) == nullptr) return;
+    if (arena.pending_returns_[class_index].head.load(std::memory_order_relaxed) == nullptr) { return; }
     FreeBlock* pending = arena.pending_returns_[class_index].head.exchange(nullptr, std::memory_order_acquire);
-    if (!pending) return;
+    if (!pending) { return; }
     ProcessPendingListLocked(arena_index, class_index, pending);
 }
 
@@ -480,19 +494,21 @@ FreeBlock* GlobalHeap::ExtractBlocksFromSlab(Slab* slab, std::size_t class_index
         PushSlab(arenas_[arena_index].full_slabs_[class_index], slab);
     }
 
-    if (tail) tail->next = nullptr;
+    if (tail) { tail->next = nullptr; }
     return head;
 }
 
 FreeBlock* GlobalHeap::AllocateBatch(std::size_t class_index, std::size_t target_count, std::size_t& actual_count, uint32_t arena_index) {
     actual_count = 0;
-    Arena& arena = arenas_[arena_index];
     FreeBlock* result = nullptr;
 
     constexpr std::size_t kFeedMaxList = 64; // bounded pending-walk threshold
 
     {
-        ScopedSpinLock lock(arena.class_locks_[class_index]);
+        // Scoped to the locked section below: nothing outside it touches
+        // this arena reference.
+        Arena& arena = arenas_[arena_index];
+        ScopedSpinLock const lock(arena.class_locks_[class_index]);
 
         // ------------------------------------------------------------------
         // 1) Direct-feed from this arena's pending queue.
@@ -580,9 +596,10 @@ FreeBlock* GlobalHeap::AllocateBatch(std::size_t class_index, std::size_t target
         // ------------------------------------------------------------------
         if (actual_count < target_count) {
             for (uint32_t off = 1; off < NUM_ARENAS && actual_count < target_count; ++off) {
-                uint32_t a2 = (arena_index + off) % NUM_ARENAS;
+                uint32_t const a2 = (arena_index + off) % NUM_ARENAS;
                 auto& lk = arenas_[a2].class_locks_[class_index];
-                if (lk.test_and_set(std::memory_order_acquire)) continue; // busy: skip
+                if (lk.test_and_set(std::memory_order_acquire)) { continue; // busy: skip
+}
                 PendingList& pl2 = arenas_[a2].pending_returns_[class_index];
                 FreeBlock* p2 = pl2.head.exchange(nullptr, std::memory_order_acquire);
                 if (p2) {
@@ -685,7 +702,7 @@ void GlobalHeap::SplitListByArena(FreeBlock* head, FreeBlock** heads, FreeBlock*
         if (FAST_UNLIKELY(!WalkLinkPlausible(next, "SplitListByArena(next)", 0))) {
             next = nullptr;
         }
-        uint32_t arena_index = head->slab->arena_index;
+        uint32_t const arena_index = head->slab->arena_index;
         if (!heads[arena_index]) {
             heads[arena_index] = head;
             tails[arena_index] = head;
@@ -699,14 +716,14 @@ void GlobalHeap::SplitListByArena(FreeBlock* head, FreeBlock** heads, FreeBlock*
 }
 
 void GlobalHeap::DeferBinToPending(std::size_t class_index, FreeBlock* head) {
-    if (!head) return;
+    if (!head) { return; }
     FreeBlock* heads[NUM_ARENAS];
     FreeBlock* tails[NUM_ARENAS];
     SplitListByArena(head, heads, tails);
 
     for (uint32_t i = 0; i < NUM_ARENAS; ++i) {
         FreeBlock* list = heads[i];
-        if (!list) continue;
+        if (!list) { continue; }
         FreeBlock* tail = tails[i];
         // Lock-free MPSC hand-off (same protocol as the contended path of
         // DeallocateBatch; established by the TSan soak evidence).
@@ -722,14 +739,14 @@ void GlobalHeap::DeferBinToPending(std::size_t class_index, FreeBlock* head) {
 }
 
 void GlobalHeap::DeallocateBatchClass(std::size_t class_index, FreeBlock* head) {
-    if (!head) return;
+    if (!head) { return; }
     FreeBlock* heads[NUM_ARENAS];
     FreeBlock* tails[NUM_ARENAS];
     SplitListByArena(head, heads, tails);
 
     for (uint32_t i = 0; i < NUM_ARENAS; ++i) {
         FreeBlock* list = heads[i];
-        if (!list) continue;
+        if (!list) { continue; }
         Arena& arena = arenas_[i];
 
         if (arena.class_locks_[class_index].test_and_set(std::memory_order_acquire)) {
@@ -775,7 +792,7 @@ void GlobalHeap::ProcessBatchLocked(uint32_t arena_index, std::size_t class_inde
             next = nullptr;
         }
         Slab* slab = curr->slab;
-        bool was_full = slab->IsFull();
+        bool const was_full = slab->IsFull();
         slab->Deallocate(curr);
 
         if (was_full) {
@@ -785,7 +802,7 @@ void GlobalHeap::ProcessBatchLocked(uint32_t arena_index, std::size_t class_inde
 
         if (slab->IsEmpty()) {
             RemoveSlab(arena.partial_slabs_[class_index], slab);
-            std::size_t freed_size = slab->memory_size; // capture BEFORE unmap
+            std::size_t const freed_size = slab->memory_size; // capture BEFORE unmap
             PageHeapFree(slab, freed_size);
             stats::CountOsFree(freed_size);
         }
@@ -795,9 +812,9 @@ void GlobalHeap::ProcessBatchLocked(uint32_t arena_index, std::size_t class_inde
 }
 
 void* GlobalHeap::AllocateLarge(std::size_t size) {
-    std::size_t page_size = OSMemory::GetPageSize();
-    std::size_t alloc_size = (size + page_size - 1) & ~(page_size - 1);
-    if (FAST_UNLIKELY(ShouldFailAllocationForTest())) return nullptr;
+    std::size_t const page_size = OSMemory::GetPageSize();
+    std::size_t const alloc_size = (size + page_size - 1) & ~(page_size - 1);
+    if (FAST_UNLIKELY(ShouldFailAllocationForTest())) { return nullptr; }
     void* p = PageHeapAllocate(alloc_size);
     if (p) {
         stats::CountOsAlloc(alloc_size);
@@ -821,8 +838,8 @@ void* GlobalHeap::AllocateLarge(std::size_t size) {
 }
 
 void GlobalHeap::DeallocateLarge(void* ptr, std::size_t size) {
-    std::size_t page_size = OSMemory::GetPageSize();
-    std::size_t alloc_size = (size + page_size - 1) & ~(page_size - 1);
+    std::size_t const page_size = OSMemory::GetPageSize();
+    std::size_t const alloc_size = (size + page_size - 1) & ~(page_size - 1);
     PageHeapFree(ptr, alloc_size);
     stats::CountOsFree(alloc_size);
 }
@@ -838,7 +855,7 @@ std::size_t GlobalHeap::PurgePageCache() {
     for (uint32_t a = 0; a < NUM_ARENAS; ++a) {
         Arena& arena = arenas_[a];
         for (std::size_t c = 0; c < NUM_SIZE_CLASSES; ++c) {
-            ScopedSpinLock lock(arena.class_locks_[c]);
+            ScopedSpinLock const lock(arena.class_locks_[c]);
             DrainPendingReturns(a, c);
         }
     }

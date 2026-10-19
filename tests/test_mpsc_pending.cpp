@@ -35,7 +35,6 @@ TEST(MpscPending, ThreadExitDefersAndNextThreadFeeds) {
     const int kBlocks = 48;            // <= kDeferMaxBin (64): deferred, not locked-flushed
     FastAllocStats before = fast_alloc_stats();
 
-    std::vector<void*> handed;
     {
         std::thread donor([&] {
             std::vector<void*> v;
@@ -242,6 +241,83 @@ TEST(MpscPending, PurgeDrainsDeferredBlocksAndReleasesSpans) {
     EXPECT_GT(t1.os_free_calls, t0.os_free_calls)
         << "purge did not release the deferred blocks' slab spans to the OS";
 }
+
+TEST(MpscPending, PurgeMustDrainSmallDeferredBins) {
+    // Complement to PurgeDrainsDeferredBlocksAndReleasesSpans: that test's
+    // 300-block donor exceeds the thread-exit defer cap (kDeferMaxBin = 64),
+    // so the bin bulk-flushes to the slabs AT JOIN - its os_free_calls bump
+    // comes from the bulk flush's slab work, not from purge's pending drain.
+    // A purge that skips DrainPendingReturns entirely therefore still passes
+    // that test. This variant keeps the donor's bin UNDER the defer cap, so
+    // EVERY block is parked on the pending queue and the only way
+    // os_free_calls can grow during fast_alloc_purge() is the drain
+    // returning those blocks to their (otherwise non-empty) slabs.
+    //
+    // Sizing: size 7001 lands in a >= 4096-byte block class whose slabs hold
+    // 32 blocks, so 48 blocks span two slabs - the first may share space
+    // with foreign live blocks (override builds), the second is donor-only
+    // and MUST empty when the drain processes it. 48 allocations exactly
+    // exhaust the refill batches (16 + 32 blocks with one popped per
+    // refill), so the bin is empty before the frees and ends at exactly 48
+    // entries - comfortably under the 64-block defer cap.
+    fast_alloc_purge_thread_cache();
+    fast_alloc_purge();
+    const std::size_t size = 7001;  // >= 4096-byte block class: 32 per slab
+    constexpr int kBlocks = 48;     // 16 + 32 refill batches: no leftover
+    std::thread donor([&] {
+        std::vector<void*> v;
+        for (int i = 0; i < kBlocks; ++i) {
+            void* p = fast_malloc(size);
+            if (p) v.push_back(p);
+        }
+        for (void* p : v) fast_free(p);
+        // Explicit hand-off while the thread is alive: same defer path as
+        // thread exit (FlushToGlobalHeap), just deterministic and visible.
+        fast_alloc_purge_thread_cache();  // 48 <= 64: deferred, no slab work
+    });
+    donor.join();
+    FastAllocStats mid = fast_alloc_stats();  // sampled after any bulk noise
+    fast_alloc_purge();  // must drain pending -> donor-only slab empties
+    FastAllocStats t1 = fast_alloc_stats();
+    EXPECT_GT(t1.os_free_calls, mid.os_free_calls)
+        << "purge did not drain the small deferred bin from the pending "
+           "queue (the donor-only slab never emptied)";
+}
+
+#if FASTALLOC_DEBUG_ENABLED
+TEST(MpscPending, TlsBinCountMatchesListLengthAfterOverflowFlush) {
+    // The TLS bin overflow flush (DeallocateBlockSlow) must keep bin.count
+    // exactly in sync with the linked list: the debug thread-exit AuditBin
+    // walks every non-empty bin and ABORTS on a count/list divergence. An
+    // off-by-one in the flush arithmetic (e.g. subtracting batch_size + 1)
+    // is invisible while the thread runs - every refill pop rewrites the
+    // count from the batch's true length - but it surfaces at exit, where
+    // the un-corrected tail bin is audited before it is handed off.
+    //
+    // Sizing: size 7001 -> a >= 4096-byte block class: CACHE_LIMITS = 512,
+    // overflow batch = 256. 513 allocations leave a refill remainder in the
+    // bin; the 513 frees then push the count over 512, firing exactly one
+    // overflow flush. The surviving tail keeps the drifted count until the
+    // thread exits, where AuditBin compares it against the walked length.
+    const std::size_t size = 7001;
+    constexpr int kBlocks = 513;  // > CACHE_LIMITS (512): one overflow flush
+    std::thread churner([&] {
+        std::vector<void*> v;
+        v.reserve(kBlocks);
+        for (int i = 0; i < kBlocks; ++i) {
+            void* p = fast_malloc(size);
+            if (p) v.push_back(p);
+        }
+        for (void* p : v) fast_free(p);
+        // Deliberately NO explicit flush here: the thread-exit path is the
+        // audit point under test.
+    });
+    churner.join();  // under a drifted count this aborts inside AuditBin
+    // Reaching here means every bin's count matched its list length.
+    FastAllocStats s = fast_alloc_stats();
+    EXPECT_GT(s.os_free_calls, 0u) << "overflow flush produced no slab work";
+}
+#endif  // FASTALLOC_DEBUG_ENABLED
 
 #if !FASTALLOC_DEBUG_ENABLED
 TEST(MpscPending, AdjacentDoubleFreeDoesNotDoubleHandOut) {

@@ -44,7 +44,10 @@ echo "=== [2/3] cppcheck ==="
 if command -v cppcheck > /dev/null 2>&1; then
     cppcheck --enable=warning,portability,performance,style \
         --std=c++17 --inline-suppr --suppress=missingIncludeSystem \
-        --suppress=unusedFunction --error-exitcode=42 \
+        --suppress=unusedFunction \
+        --suppress=toomanyconfigs \
+        --suppress=normalCheckLevelMaxBranches \
+        --error-exitcode=42 \
         -Iinclude -Isrc --platform=unix64 \
         include/ src/ tests/ benchmarks/ fuzz/ 2>&1 | tail -30 || RC=${PIPESTATUS[0]}
     RC=${RC:-0}

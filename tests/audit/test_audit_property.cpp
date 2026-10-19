@@ -36,14 +36,14 @@ public:
     bool insert(void* p, std::size_t size, std::size_t seed) {
         auto it = std::lower_bound(live.begin(), live.end(), Rec{p, 0, 0}, BlockCmp{});
         if (it != live.end() && it->p == p) return false;               // duplicate
-        void* lo = static_cast<char*>(p) + 1;
-        void* hi = static_cast<char*>(p) + size - 1;
+        const void* lo = static_cast<char*>(p) + 1;
+        const void* hi = static_cast<char*>(p) + size - 1;
         if (it != live.begin()) {
-            void* prev_hi = static_cast<char*>(std::prev(it)->p) + std::prev(it)->size - 1;
+            const void* prev_hi = static_cast<char*>(std::prev(it)->p) + std::prev(it)->size - 1;
             if (prev_hi >= lo) return false;                             // overlaps predecessor
         }
         if (it != live.end()) {
-            void* next_lo = it->p;
+            const void* next_lo = it->p;
             if (next_lo <= hi) return false;                            // overlaps successor
         }
         live.insert(it, Rec{p, size, seed});
@@ -139,7 +139,7 @@ static bool PropertyRun(unsigned seed, std::size_t ops, std::size_t max_live,
             live_stack[idx] = live_stack.back();
             live_stack.pop_back();
             if (cross_verify_patterns) {
-                auto* c = static_cast<unsigned char*>(b.p);
+                const unsigned char* c = static_cast<const unsigned char*>(b.p);
                 for (std::size_t i = 0; i < b.size; ++i) {
                     if (c[i] != PB(b.seed, i)) {
                         std::fprintf(stderr, "[seed %u op %zu] pattern broken before free at %zu (size %zu)\n",
@@ -155,8 +155,8 @@ static bool PropertyRun(unsigned seed, std::size_t ops, std::size_t max_live,
         } else {  // WRITE + READ verify of a random live block (items 2/3)
             if (live_stack.empty()) continue;
             std::size_t idx = rng() % live_stack.size();
-            auto& b = live_stack[idx];
-            auto* c = static_cast<unsigned char*>(b.p);
+            const auto& b = live_stack[idx];
+            const unsigned char* c = static_cast<const unsigned char*>(b.p);
             for (std::size_t i = 0; i < b.size; ++i) {
                 if (c[i] != PB(b.seed, i)) {
                     std::fprintf(stderr, "[seed %u op %zu] contents of %p changed at %zu (size %zu)\n",
@@ -166,7 +166,7 @@ static bool PropertyRun(unsigned seed, std::size_t ops, std::size_t max_live,
             }
         }
     }
-    for (auto& b : live_stack) fast_free(b.p);
+    for (const auto& b : live_stack) fast_free(b.p);
     return true;
 }
 
@@ -214,8 +214,8 @@ TEST(AuditProperty, PatternPreservationUnderChurn) {
             void* u = fast_malloc(1 + rng() % (1 << 20));
             if (u) fast_free(u);
         }
-        for (auto& kv : keep) {
-            auto* c = static_cast<unsigned char*>(kv.first);
+        for (const auto& kv : keep) {
+            const unsigned char* c = static_cast<const unsigned char*>(kv.first);
             for (std::size_t i = 0; i < kv.second; ++i) {
                 ASSERT_EQ(c[i], pat) << "pattern 0x" << std::hex << (int)pat
                                      << " destroyed at " << i << " size " << kv.second;

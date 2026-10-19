@@ -128,7 +128,7 @@ TEST(StressTest, MultithreadedSoak) {
                 LiveBlock b = live[idx];
                 live[idx] = live.back();
                 live.pop_back();
-                unsigned char* c = static_cast<unsigned char*>(b.ptr);
+                const unsigned char* c = static_cast<const unsigned char*>(b.ptr);
                 bool ok = true;
                 for (std::size_t i = 0; i < b.size; ++i) {
                     if (c[i] != PatternByte(b.seed, i)) { ok = false; break; }

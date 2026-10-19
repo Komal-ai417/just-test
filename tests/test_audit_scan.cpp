@@ -68,9 +68,9 @@ inline int CaptureFileno(std::FILE* f) {
 // on destruction. No fclose/fdopen dance: the FILE never closes.
 class StderrCapture {
 public:
-    StderrCapture() {
-        path_ = testing::TempDir() + "fastalloc_audit_scan_" +
-                std::to_string(NextSerial()) + ".err";
+    StderrCapture()
+        : path_(testing::TempDir() + "fastalloc_audit_scan_" +
+                std::to_string(NextSerial()) + ".err") {
         fd_ = CaptureFileno(stderr);
         std::fflush(stderr);
         saved_ = CaptureDup(fd_);
@@ -139,7 +139,7 @@ TEST(AuditScan, TlsBinHeadInRangeIsReported) {
     void* p = fast_malloc(size);
     ASSERT_NE(p, nullptr);
     fast_free(p);  // the block base is now the class bin head
-    char* block_base = static_cast<char*>(p) - 16;
+    const char* block_base = static_cast<char*>(p) - 16;
 
     StderrCapture cap;
     ASSERT_TRUE(cap.Ok()) << "stderr capture setup failed (freopen/dup)";
@@ -199,7 +199,7 @@ TEST(AuditScan, PageBinHeadInRangeIsReported) {
     ASSERT_NE(p, nullptr);
     fast_free(p);
     fast_alloc_purge_thread_cache();  // span now parked in the page cache
-    char* span_base = reinterpret_cast<char*>(p) - 16;
+    const char* span_base = reinterpret_cast<char*>(p) - 16;
 
     StderrCapture cap;
     ASSERT_TRUE(cap.Ok()) << "stderr capture setup failed (freopen/dup)";

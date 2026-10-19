@@ -9,6 +9,7 @@
 
 #include <cstring>
 #include <vector>
+#include <algorithm>
 
 using namespace FastAlloc;
 
@@ -54,9 +55,9 @@ TEST(LargeAllocTest, CacheServesMultipleSizes) {
     for (std::size_t i = 0; i < n; ++i) {
         void* p = fast_malloc(sizes[i]);
         ASSERT_NE(p, nullptr);
-        for (void* q : first) {
-            if (q == p) { ++reused; break; }
-        }
+        const bool hit = std::any_of(
+            first.begin(), first.end(), [p](const void* q) { return q == p; });
+        if (hit) ++reused;
         fast_free(p);
     }
     // At least the majority should be direct cache hits.

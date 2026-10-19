@@ -121,7 +121,7 @@ constexpr std::size_t ALIGNMENT = 16;         // 16-byte alignment
 constexpr std::uintptr_t kMinCanonicalUserPtr = 0x10000;
 
 // Upper canonical address bound for 48-bit user virtual address space.
-constexpr std::uintptr_t kMaxCanonicalUserPtr = 0x0000800000000000ull;
+constexpr std::uintptr_t kMaxCanonicalUserPtr = 0x0000800000000000ULL;
 
 // Validates whether a pointer is plausible for a FastAlloc allocation:
 //   - >= 64 KB (avoids null page and small-integer values)
@@ -142,7 +142,7 @@ constexpr std::size_t NUM_SIZE_CLASSES = MAX_SLAB_SIZE / ALIGNMENT;
 
 // Map requested size to size class index (0-based)
 inline std::size_t SizeToClassIndex(std::size_t size) {
-    if (size == 0) return 0;
+    if (size == 0) { return 0; }
     return (size - 1) >> 4;
 }
 
@@ -181,13 +181,13 @@ inline std::size_t MaxSmallRequest() { return MAX_SLAB_SIZE - USER_OFFSET; }
 constexpr std::array<uint32_t, NUM_SIZE_CLASSES> ComputeCacheLimits() {
     std::array<uint32_t, NUM_SIZE_CLASSES> limits{};
     for (std::size_t i = 0; i < NUM_SIZE_CLASSES; ++i) {
-        std::size_t size = (i + 1) * ALIGNMENT;
-        if (size <= 64) limits[i] = 16384;
-        else if (size <= 256) limits[i] = 8192;
-        else if (size <= 1024) limits[i] = 4096;
-        else if (size <= 4096) limits[i] = 1024;
-        else if (size <= 8192) limits[i] = 512;
-        else limits[i] = 128;
+        std::size_t const size = (i + 1) * ALIGNMENT;
+        if (size <= 64) { limits[i] = 16384;
+        } else if (size <= 256) { limits[i] = 8192;
+        } else if (size <= 1024) { limits[i] = 4096;
+        } else if (size <= 4096) { limits[i] = 1024;
+        } else if (size <= 8192) { limits[i] = 512;
+        } else { limits[i] = 128; }
     }
     return limits;
 }
@@ -207,7 +207,7 @@ static constexpr std::size_t NUM_LARGE_CLASSES = 64;
 static constexpr std::size_t LARGE_CLASS_BASE = 12; // 4096 bytes (page size)
 
 inline std::size_t LargeSizeToClass(std::size_t size) {
-    if (size <= (1ULL << LARGE_CLASS_BASE)) return 0;
+    if (size <= (1ULL << LARGE_CLASS_BASE)) { return 0; }
     unsigned long clz = 0;
 #if defined(_MSC_VER)
 #if defined(_WIN64)
@@ -218,7 +218,7 @@ inline std::size_t LargeSizeToClass(std::size_t size) {
 #else
     clz = 63 - __builtin_clzll((unsigned long long)(size - 1));
 #endif
-    std::size_t cls = clz - LARGE_CLASS_BASE + 1;
+    std::size_t const cls = clz - LARGE_CLASS_BASE + 1;
     return cls < NUM_LARGE_CLASSES ? cls : NUM_LARGE_CLASSES - 1;
 }
 
@@ -226,9 +226,9 @@ inline std::size_t LargeSizeToClass(std::size_t size) {
 // Debug patterns & magic values
 // ============================================================================
 namespace debug {
-    constexpr uint32_t FRONT_CANARY     = 0xC8C8C8C8u; // written at alloc, checked at free (underflow)
-    constexpr uint64_t SLAB_MAGIC       = 0x5A8B0D5A8B0D0001ull; // validates slab provenance
-    constexpr uint64_t LARGE_MAGIC      = 0xFA578AFA578A0002ull; // validates large header
+    constexpr uint32_t FRONT_CANARY     = 0xC8C8C8C8U; // written at alloc, checked at free (underflow)
+    constexpr uint64_t SLAB_MAGIC       = 0x5A8B0D5A8B0D0001ULL; // validates slab provenance
+    constexpr uint64_t LARGE_MAGIC      = 0xFA578AFA578A0002ULL; // validates large header
     constexpr unsigned char RED_ZONE    = 0xBB; // rear red-zone fill (overflow)
     constexpr unsigned char POISON_FREE = 0xDD; // freed-block fill (UAF write detection)
     constexpr unsigned char FRESH       = 0xCD; // never-touched block fill

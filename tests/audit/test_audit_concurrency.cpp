@@ -81,7 +81,7 @@ static bool ThreadSweep(int nthreads, std::size_t ops_per_thread, std::size_t ma
             }
             ++ct.ops;
         }
-        for (auto& kv : live) fast_free(kv.first);
+        for (const auto& kv : live) fast_free(kv.first);
     };
     std::vector<std::thread> ts;
     for (int i = 0; i < nthreads; ++i) ts.emplace_back(worker, i);
@@ -358,7 +358,7 @@ TEST(AuditConcurrency, ManyProducersOneConsumerMPSC) {
             int k = static_cast<int>((tag >> 0) & 0xFFFFFFFFull);
             (void)k;
             // Verify the pattern prefix + last byte, then free cross-thread.
-            auto* c = static_cast<unsigned char*>(p);
+            const unsigned char* c = static_cast<const unsigned char*>(p);
             bool ok = true;
             for (std::size_t i = 0; i < sz && i < 64; ++i) {
                 uint64_t expect_tag = (static_cast<uint64_t>(id) << 32) |

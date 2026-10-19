@@ -21,6 +21,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <numeric>
 #include <string>
 #include <thread>
 #include <vector>
@@ -42,8 +43,7 @@ struct Sample {
 static Sample Summarize(std::vector<double>& xs) {
     std::sort(xs.begin(), xs.end());
     Sample s{};
-    double sum = 0;
-    for (double x : xs) sum += x;
+    const double sum = std::accumulate(xs.begin(), xs.end(), 0.0);
     s.mean = xs.empty() ? 0 : sum / static_cast<double>(xs.size());
     auto q = [&](double p) {
         return xs.empty() ? 0 : xs[static_cast<std::size_t>(p * (xs.size() - 1))];

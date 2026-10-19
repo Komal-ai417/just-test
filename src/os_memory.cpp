@@ -276,7 +276,7 @@ struct SpanPool {
             }
         }
         void* result = nullptr;
-        std::size_t n = count.load(std::memory_order_relaxed);
+        std::size_t const n = count.load(std::memory_order_relaxed);
         for (std::size_t i = 0; i < n; ++i) {
             Chunk& c = chunks[i];
             char* bump = static_cast<char*>(c.bump);
@@ -309,9 +309,9 @@ struct SpanPool {
         // Lock-free read is safe: chunk base/limit are immutable after
         // publication; 'count' is release-incremented in Carve and
         // acquire-loaded here, which orders the record fields.
-        std::size_t n = count.load(std::memory_order_acquire);
+        std::size_t const n = count.load(std::memory_order_acquire);
         for (std::size_t i = 0; i < n; ++i) {
-            if (ptr >= chunks[i].base && ptr < chunks[i].limit) return true;
+            if (ptr >= chunks[i].base && ptr < chunks[i].limit) { return true; }
         }
         return false;
     }
@@ -351,7 +351,7 @@ void* OSMemory::AllocatePages(std::size_t size) {
     // Small spans ride the chunk pool (THP + VMA count + no per-slab mmap);
     // oversized requests and pool exhaustion fall back to direct mmap.
     if (IsPooledSpanSize(size)) {
-        if (void* p = Pool().Carve(size)) return p;
+        if (void* p = Pool().Carve(size)) { return p; }
     }
 #endif
     void* ptr = mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
@@ -363,7 +363,7 @@ void* OSMemory::AllocatePages(std::size_t size) {
 }
 
 void OSMemory::FreePages(void* ptr, std::size_t size) {
-    if (!ptr) return;
+    if (!ptr) { return; }
 #if defined(_WIN32) || FASTALLOC_WINVA
     // Reservation-aware release: decommit the (possibly interior) span,
     // MEM_RELEASE the whole reservation only when its last live span is
@@ -390,7 +390,7 @@ void OSMemory::DecommitPages(void* ptr, std::size_t size) {
     // reserved; a later touch faults until re-committed. The registry keeps
     // the live-byte count consistent so the eventual span release still
     // frees the whole reservation exactly once.
-    if (!ptr || size == 0) return;
+    if (!ptr || size == 0) { return; }
 #if defined(_WIN32) || FASTALLOC_WINVA
     WinRegistry().DecommitRange(ptr, size);
 #else

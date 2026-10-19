@@ -100,6 +100,10 @@ inline const char* SegvCodeName(int code) {
     }
 }
 
+// POSIX fixes the sa_sigaction handler signature (int, siginfo_t*, void*);
+// the parameter cannot be made const without a function-pointer cast at
+// registration.
+// cppcheck-suppress constParameterPointer
 inline void ReportAndDie(int sig, siginfo_t* info, void* uc) {
     // Include si_code in diagnostic output to distinguish between invalid
     // mappings, access permission faults, and general protection violations.
@@ -160,6 +164,10 @@ inline void TrapFaultOrDie(int sig, siginfo_t* info, void* uc) {
                 }
                 void* frames[8];
                 int nf = 0;
+                // REG_RIP comes from <ucontext.h>, which cppcheck does not
+                // read (system headers suppressed); in the config it checks,
+                // rip is legitimately "always null" here.
+                // cppcheck-suppress knownConditionTrueFalse
                 if (rip) frames[nf++] = rip;
                 nf += backtrace(frames + nf, 8 - nf);
                 char msg[192];
@@ -193,6 +201,10 @@ inline bool Install() {
 
 #elif defined(_WIN32) && !defined(FASTALLOC_BENCH_CRASH_REPORTER_OFF)
 
+// The Windows unhandled-exception-filter ABI fixes this signature
+// (LONG (WINAPI*)(EXCEPTION_POINTERS*)); const would need a cast at
+// AddVectoredExceptionHandler registration.
+// cppcheck-suppress constParameterCallback
 inline LONG WINAPI ReportAndDie(EXCEPTION_POINTERS* ep) {
     if (ep && ep->ExceptionRecord) {
         std::fprintf(stderr,

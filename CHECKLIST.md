@@ -14,11 +14,11 @@ bug-fix, and expansion pass (October 2026).
 | 🧰 | Provided as a runnable script in `tools/` — executes wherever the external tool is installed |
 
 **Local verification baseline (this pass, 2-CPU sandbox, GCC 14):**
-release 141/141 · debug 173/173 (+1 design skip) · override-new release 141/141 + 12/12 ·
-override-new debug 174/174 + 12/12 · ASan 141/141 + 49/49 · UBSan 141/141 + 49/49 ·
+release 142/142 · debug 175/175 (+1 design skip) · override-new release 142/142 + 12/12 ·
+override-new debug 175/175 + 12/12 · ASan 141/141 + 49/49 · UBSan 141/141 + 49/49 ·
 TSan 141/141 + 49/49 · LSan(debug) 173/173 · fuzz release 27.5 M ops CLEAN ·
 fuzz debug 11.1 M ops CLEAN · fuzz ASan 11.4 M ops CLEAN · mutation 10/10 killed ·
-static-analysis (GCC pedantic matrix) CLEAN.
+static-analysis CLEAN (GCC pedantic matrix + cppcheck 2.17 + clang-tidy 19, 0 warnings).
 
 ---
 
@@ -60,7 +60,7 @@ static-analysis (GCC pedantic matrix) CLEAN.
 | LSan (leaks) | ✅ | Debug+leak build green locally (173); CI `leaks` job |
 | MSan (uninitialized reads) | 🤖🧰 | clang-only: `tools/msan_check.sh` + CI `msan` job (no local clang in this sandbox) |
 | TSan (data races) | ✅ | All suites green locally (141 + 49, incl. 64-thread sweep under TSan); CI `sanitizers` |
-| Valgrind Memcheck | 🤖🧰 | `tools/valgrind_memcheck.sh` + CI `valgrind` job |
+| Valgrind Memcheck | 🤖🧰 | `tools/valgrind_memcheck.sh` + CI `valgrind` job; full log streams live (tee + stdbuf line-buffering), post-mortem copy in `valgrind_<suite>.log` |
 | Valgrind Massif (heap growth) | 🧰 | `tools/valgrind_massif.sh` |
 | Heaptrack | 🧰 | `tools/heaptrack.sh` |
 
@@ -97,7 +97,7 @@ static-analysis (GCC pedantic matrix) CLEAN.
 | Cross-allocator benchmark (glibc/jemalloc/mimalloc) | ✅🧰 | `bench_suite` + `run_matrix.sh` + `analyze.py`; `tools/cross_allocator_matrix.sh` auto-discovers libs (jemalloc verified locally); CI `benchmark-matrix` installs jemalloc |
 | perf stat / record / c2c | 🧰🤖 | `tools/perf_stat.sh`, `perf_record_flamegraph.sh`, `perf_c2c.sh` (no perf in sandbox) |
 | Flamegraph | 🧰 | `tools/perf_record_flamegraph.sh` (auto-clones FlameGraph) |
-| Cachegrind / Callgrind | 🧰 | `tools/valgrind_cachegrind.sh`, `valgrind_callgrind.sh` |
+| Cachegrind / Callgrind | 🤖🧰 | `tools/valgrind_cachegrind.sh` (wired into the CI `valgrind` job: miss ratios, LL-sorted hotspots, annotated lines; `--cache-sim=yes` explicit), `valgrind_callgrind.sh` |
 | Heaptrack (alloc hotspots) | 🧰 | `tools/heaptrack.sh` |
 | Latency percentiles p50/p90/p99/p99.9 | ✅ | `fast_alloc_bench_audit` (all op classes, warm + cold), `bench_suite` p50/p99/p99.9 |
 | Throughput (allocs/s, frees/s, ops/s) | ✅ | `bench_suite` ops/s + JSONL, `bench_audit` Mops/s |
@@ -153,7 +153,7 @@ static-analysis (GCC pedantic matrix) CLEAN.
 | gcov / gcovr / coverage targets | ➕ | CMake `-DFASTALLOC_COVERAGE=ON` + `coverage` target; measured this pass: release core ~89 % (fast_alloc.cpp), debug adds registry/poison/logging coverage |
 | lcov / llvm-cov | 🤖 | gcovr is the portable default; llvm-cov for clang documented (same gcov-exclude filters) |
 | Line/branch/function coverage | ➕ | gcovr `--branches` report + CI `coverage` job with a 70 % line-coverage gate + uploaded XML |
-| Mutation testing | ➕ | `tools/mutation_test.sh`: 10 curated mutants, **10/10 killed** (9 by tests, 1 stillborn caught by -Werror); CI `mutation` job (nightly/manual) |
+| Mutation testing | ➕🤖🧰 | `tools/mutation_test.sh`: 10 curated mutants, **10/10 killed** (m05/m09 closed by `PurgeMustDrainSmallDeferredBins` + `TlsBinCountMatchesListLengthAfterOverflowFlush`); CI `mutation` job runs on every push/PR + nightly + manual dispatch (`--only`/`--full` flags) |
 
 ## 11. ABI / API compatibility
 

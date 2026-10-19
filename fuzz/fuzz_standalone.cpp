@@ -5,6 +5,7 @@
 //        [../src/*.cpp] -pthread
 // Usage: ./fuzz_standalone <seconds> [seed]
 #include "fuzz_core.h"
+#include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -28,7 +29,8 @@ int main(int argc, char** argv) {
         if (el >= budget) break;
         std::size_t len = 1 + rng() % 96;          // 1..96 byte-ops per input
         std::vector<uint8_t> prog(len);
-        for (auto& b : prog) b = static_cast<uint8_t>(rng() & 0xFF);
+        std::generate(prog.begin(), prog.end(),
+                      [&rng] { return static_cast<uint8_t>(rng() & 0xFF); });
         ++inputs;
         if (!fuzzcore::RunProgram(prog.data(), prog.size(), shadow, st)) {
             std::fprintf(stderr, "STANDALONE FUZZ FAILURE (seed=%u input=%zu)\nbytes:", seed, inputs);
@@ -38,7 +40,7 @@ int main(int argc, char** argv) {
         }
         // periodically drain: force cross-class reuse pressure
         if (inputs % 512 == 0) {
-            for (auto& kv : shadow.live) FastAlloc::fast_free(kv.first);
+            for (const auto& kv : shadow.live) FastAlloc::fast_free(kv.first);
             shadow.live.clear();
         }
     }

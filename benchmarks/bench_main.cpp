@@ -54,7 +54,7 @@ public:
     BenchGuardStats& operator=(const BenchGuardStats&) = delete;
 
     // fast_malloc returned a value that cannot be a block pointer.
-    void ReportStoreTime(int i, void* bad) {
+    void ReportStoreTime(int i, const void* bad) {
         store_time_hits_.fetch_add(1, std::memory_order_relaxed);
         if (ShouldPrint()) {
             std::fprintf(stderr,
@@ -69,7 +69,7 @@ public:
     // Slot value differs from the store-time witness: the slot (or the
     // register/stack slot in transit) was overwritten AFTER fast_malloc
     // returned. Caller-side wild write; value never freed.
-    void ReportDivergence(int i, void* bad, void* w, void* const* arr, int batch) {
+    void ReportDivergence(int i, const void* bad, const void* w, void* const* arr, int batch) {
         divergence_hits_.fetch_add(1, std::memory_order_relaxed);
         if (ShouldPrint()) {
             std::fprintf(stderr,
@@ -88,7 +88,7 @@ public:
 
     // Slot equals the witness but fails plausibility: fast_malloc itself
     // returned this value (allocator-side).
-    void ReportAllocatorReturn(int i, void* bad) {
+    void ReportAllocatorReturn(int i, const void* bad) {
         alloc_return_hits_.fetch_add(1, std::memory_order_relaxed);
         if (ShouldPrint()) {
             std::fprintf(stderr,
@@ -323,6 +323,9 @@ static void BM_MallocFree_FastAlloc(benchmark::State& state) {
         slots.UnfreezeWrites();
         // On detected violations, dump every allocator-internal pointer that
         // targets the array's guarded region (rate-limited to avoid benchmarking overhead).
+        // audit_lo() returns a real region in the guarded-write config;
+        // cppcheck only sees the non-guarded stub build where it is nullptr.
+        // cppcheck-suppress knownConditionTrueFalse
         if (violated && guard_stats.ShouldAudit() && slots.audit_lo()) {
             fast_alloc_audit_pointers(slots.audit_lo(), slots.audit_hi());
         }

@@ -22,11 +22,108 @@ Checks: >
   -misc-non-private-member-variables-in-classes,
   -cppcoreguidelines-non-private-member-variables-in-classes,
   -cppcoreguidelines-pro-type-member-init,
+  -cppcoreguidelines-pro-bounds-pointer-arithmetic,
+  -cppcoreguidelines-pro-bounds-constant-array-index,
+  -cppcoreguidelines-pro-bounds-array-to-pointer-decay,
+  -cppcoreguidelines-pro-type-reinterpret-cast,
+  -cppcoreguidelines-pro-type-vararg,
+  -cppcoreguidelines-pro-type-const-cast,
+  -cppcoreguidelines-macro-usage,
+  -cppcoreguidelines-avoid-c-arrays,
+  -modernize-avoid-c-arrays,
+  -cppcoreguidelines-avoid-non-const-global-variables,
+  -cppcoreguidelines-owning-memory,
+  -cppcoreguidelines-no-malloc,
+  -cppcoreguidelines-avoid-do-while,
+  -cppcoreguidelines-init-variables,
+  -cppcoreguidelines-special-member-functions,
+  -modernize-use-equals-delete,
+  -performance-no-int-to-ptr,
+  -performance-enum-size,
+  -misc-include-cleaner,
+  -misc-no-recursion,
+  -modernize-use-auto,
+  -readability-implicit-bool-conversion,
+  -readability-avoid-nested-conditional-operator,
+WarningsAsErrors: 'bugprone-*,cert-*,clang-analyzer-*,concurrency-*'
+HeaderFilterRegex: 'src/.*|include/.*'
+FormatStyle: file
+CheckOptions:
+  # DeMorgan rewriting is off: this codebase's guard idiom is explicit
+  # failure disjunctions ("a is bad || b is bad") under FAST_UNLIKELY, which
+  # reads clearer than the negated conjunctive form the rewrite produces
+  # ("!(a is fine && b is fine)"). The other simplify-boolean-expr rewrites
+  # (redundant negation, conditional-to-assignment, chained returns) stay on.
+  - key: readability-simplify-boolean-expr.SimplifyDeMorgan
+    value: 'false'
+# ---------------------------------------------------------------------------
+# Rationale for the disables above, so future readers know these are policy,
+# not oversight:
+#
 # bugprone-easily-swappable-parameters is disabled: it flags every natural
 # same-type parameter pair this codebase is built on (scan ranges lo/hi,
 # size/capacity pairs, arena/class indices), where strong typedefs would
 # obscure rather than clarify; swap-safety is enforced by naming discipline
 # and the differential suites instead.
-WarningsAsErrors: 'bugprone-*,cert-*,clang-analyzer-*,concurrency-*'
-HeaderFilterRegex: 'src/.*|include/.*'
-FormatStyle: file
+#
+# pro-bounds-pointer-arithmetic / -constant-array-index /
+# -array-to-pointer-decay, pro-type-reinterpret-cast, no-int-to-ptr:
+# an allocator IS pointer arithmetic over raw memory. Slab headers, bins and
+# page-cache indices are addressed dynamically by design, block headers are
+# reached through reinterpret_cast, and freelist links are
+# compressed-as-integer storage. None of these have a non-raw equivalent.
+#
+# pro-type-vararg / pro-type-const-cast: the diagnostics paths fprintf
+# directly (varargs) on purpose - no allocations, no iostream static-init
+# order hazards, usable from failure paths deep inside the allocator. The
+# const_casts are confined to printing const nodes through %p.
+#
+# macro-usage: platform/compiler hooks (FAST_CPU_PAUSE, branch-hint macros,
+# feature probes) must be macros for token pasting and __builtin selection.
+#
+# avoid-c-arrays (cppcoreguidelines + modernize): cache-line padding
+# ("char pad[64 - sizeof(x)]") and slab-layout arrays need C-array
+# declarations; std::array adds nothing to a byte-image layout.
+#
+# avoid-non-const-global-variables: the heap, page cache and TLS key ARE
+# mutable global state - that is the architecture (single global heap,
+# per-thread caches hanging off it).
+#
+# owning-memory / no-malloc: raw memory management is the product. gsl::
+# annotations would add ceremony without adding safety inside the one
+# component that is allowed to see raw storage.
+#
+# avoid-do-while: lock acquisition and CAS retry loops are do/while by
+# construction (first attempt happens before the re-test).
+#
+# special-member-functions / use-equals-delete: the singletons (GlobalHeap,
+# PageCache, TLSCache...) delete their copy ops and never move; synthesised
+# move members would be dead weight on classes that live for the whole
+# process.
+#
+# performance-enum-size: enum widths are layout-relevant in the padded
+# control structures; re-sizing them needs a deliberate layout audit, not a
+# tidy fixit.
+#
+# misc-include-cleaner: too noisy about transitively-supplied std:: symbols;
+# every one of its reports here was a header used indirectly via another
+# project header.
+#
+# misc-no-recursion: registry/leak dump helpers recurse over bounded
+# structures by nature.
+#
+# cppcoreguidelines-init-variables: every report here is a false positive on
+# "type x = mmap(...)/mremap(...)/atomic.load(...)" style initializers (the
+# check cannot model calls as initialising). Actual uninitialized reads are
+# caught far more precisely by the MSan CI job, which runs the allocator's
+# whole API surface under shadow-memory tracking.
+#
+# modernize-use-auto: allocator internals favour explicit types (uintptr_t,
+# char*, FreeBlock*) - the exact-type documentation is the point.
+#
+# readability-implicit-bool-conversion: "if (ptr)" is the idiomatic systems
+# style used consistently across the codebase; forcing "!= nullptr" adds
+# churn without adding safety.
+#
+# readability-avoid-nested-conditional-operator: the single existing
+# occurrence is a deliberate two-level min/max fold.

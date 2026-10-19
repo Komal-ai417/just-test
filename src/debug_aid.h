@@ -42,8 +42,8 @@ void LogEvent(LogLevel level, const char* event, const char* fmt, ...); // NOLIN
 void LogSetLevel(LogLevel level);
 LogLevel LogGetLevel();
 #else
-inline void LogEvent(LogLevel, const char*, const char* ...) {} // NOLINT(cert-dcl50-cpp)
-inline void LogSetLevel(LogLevel) {}
+inline void LogEvent(LogLevel /*unused*/, const char* /*unused*/, const char*  /*unused*/...) {} // NOLINT(cert-dcl50-cpp)
+inline void LogSetLevel(LogLevel /*unused*/) {}
 inline LogLevel LogGetLevel() { return LogLevel::Off; }
 #endif
 
@@ -127,7 +127,7 @@ private:
     Shard shards_[kShardCount];
 
     std::atomic<std::size_t> sequence_{0};
-    std::size_t HashShard(void* p) const;
+    static std::size_t HashShard(void* p);
     static void GrowShard(Shard& shard);
 };
 

@@ -12,6 +12,7 @@
 #include <limits>
 #include <cstdio>
 #include <cstdlib>
+#include <algorithm>
 
 #if !defined(_WIN32)
 #include <sys/mman.h>
@@ -29,7 +30,7 @@ static_assert(sizeof(FreeBlock) == 24, "FreeBlock layout contract");
 //     aligned-16: ALIGN_MAGIC   <- read by fast_free as block->slab
 //     aligned- 8: requested size
 namespace {
-constexpr std::uintptr_t ALIGN_MAGIC = 0xA1A2A3A4A5A6A701ull; // odd, never a real Slab*
+constexpr std::uintptr_t ALIGN_MAGIC = 0xA1A2A3A4A5A6A701ULL; // odd, never a real Slab*
 
 
 inline std::size_t EffectivePageSize() {
@@ -39,9 +40,9 @@ inline std::size_t EffectivePageSize() {
 
 // Logs diagnostic information once if an out-of-range size class index is encountered.
 #if !FASTALLOC_DEBUG_ENABLED
-inline void ReportCorruptClassIndex(void* ptr, std::uint32_t class_index) {
+inline void ReportCorruptClassIndex(const void* ptr, std::uint32_t class_index) {
 #if defined(__GNUC__) || defined(__clang__)
-    if (__builtin_expect(class_index < NUM_SIZE_CLASSES, 1)) return;
+    if (__builtin_expect(class_index < NUM_SIZE_CLASSES, 1)) { return; }
 #endif
     // Atomic one-shot reporting to avoid duplicate logs across threads.
     static std::atomic<bool> reported{false};
@@ -60,11 +61,11 @@ inline void ReportCorruptClassIndex(void* ptr, std::uint32_t class_index) {
 inline bool LargeHeaderSizePlausible(std::size_t alloc_size) {
     const std::size_t page = EffectivePageSize();
     return alloc_size >= page && (alloc_size % page) == 0 &&
-           alloc_size < (1ull << 48);
+           alloc_size < (1ULL << 48);
 }
 
 // Logs diagnostic information once when a large allocation header has an invalid size.
-inline void ReportCorruptLargeHeader(void* ptr, std::size_t alloc_size) {
+inline void ReportCorruptLargeHeader(const void* ptr, std::size_t alloc_size) {
     static std::atomic<bool> reported{false};
     if (!reported.exchange(true, std::memory_order_relaxed)) {
         (void)std::fprintf(stderr,
@@ -77,7 +78,7 @@ inline void ReportCorruptLargeHeader(void* ptr, std::size_t alloc_size) {
 }
 
 // Logs diagnostic information once when an invalid pointer is passed to free.
-inline void ReportNonCanonicalFree(void* ptr) {
+inline void ReportNonCanonicalFree(const void* ptr) {
     static std::atomic<bool> reported{false};
     if (!reported.exchange(true, std::memory_order_relaxed)) {
         (void)std::fprintf(stderr,
@@ -90,7 +91,7 @@ inline void ReportNonCanonicalFree(void* ptr) {
 }
 
 // Logs diagnostic information once if an allocation exit check detects an invalid pointer.
-inline void ReportWildReturnValue(void* ptr) {
+inline void ReportWildReturnValue(const void* ptr) {
     static std::atomic<bool> reported{false};
     if (!reported.exchange(true, std::memory_order_relaxed)) {
         (void)std::fprintf(stderr,
@@ -103,7 +104,7 @@ inline void ReportWildReturnValue(void* ptr) {
 }
 
 inline std::size_t PageRoundUp(std::size_t n) {
-    std::size_t page = EffectivePageSize();
+    std::size_t const page = EffectivePageSize();
     return (n + page - 1) & ~(page - 1);
 }
 
@@ -240,7 +241,7 @@ AllocRecord DebugOnFreeSmall(void* user, FreeBlock* block) {
     return rec;
 }
 
-AllocRecord DebugOnFreeLarge(void* user, LargeAllocHeader* header) {
+AllocRecord DebugOnFreeLarge(void* user, const LargeAllocHeader* header) {
     AllocRecord rec{};
     if (!AllocRegistry::GetInstance().Erase(user, &rec)) {
         FatalDebug(Violation::DoubleFree, user, 0,
@@ -285,13 +286,20 @@ AllocRecord DebugOnFreeLarge(void* user, LargeAllocHeader* header) {
 // ===========================================================================
 void* fast_malloc(std::size_t size) {
     // Zero-size policy: unique non-null pointer.
-    if (size == 0) size = 1;
+    if (size == 0) { size = 1; }
 
     if (FAST_UNLIKELY(size > MaxSmallRequest())) {
+        // Overflow pre-check in canonical form: reject before the addition so
+        // the guard is provably live (a post-hoc "alloc_size < size" test is
+        // dead code to analysers because unsigned wrap is invisible to them).
+        if (FAST_UNLIKELY(size >
+                (std::numeric_limits<std::size_t>::max)() -
+                sizeof(LargeAllocHeader))) {
+            return nullptr; // header addition would wrap
+        }
         std::size_t alloc_size = size + sizeof(LargeAllocHeader);
-        if (FAST_UNLIKELY(alloc_size < size)) return nullptr; // overflow
 
-        std::size_t page_size = EffectivePageSize();
+        std::size_t const page_size = EffectivePageSize();
         if (FAST_UNLIKELY(alloc_size >
                           (std::numeric_limits<std::size_t>::max)() - page_size + 1)) {
             return nullptr;
@@ -326,10 +334,10 @@ void* fast_malloc(std::size_t size) {
         return nullptr; // OOM
     }
 
-    std::size_t class_index = RequestToClass(size);
+    std::size_t const class_index = RequestToClass(size);
     TLSCache& tls = TLSCache::GetFast();
     FreeBlock* block = static_cast<FreeBlock*>(tls.AllocateBlock(class_index));
-    if (FAST_UNLIKELY(!block)) return nullptr;
+    if (FAST_UNLIKELY(!block)) { return nullptr; }
 
     void* user = reinterpret_cast<char*>(block) + USER_OFFSET;
     // Exit gate: ensure pointer passes plausibility check before returning.
@@ -353,7 +361,7 @@ void* fast_malloc(std::size_t size) {
 }
 
 void fast_free(void* ptr) {
-    if (!ptr) return;
+    if (!ptr) { return; }
 
     // Verify pointer plausibility before reading header.
     if (FAST_UNLIKELY(!IsPlausibleHeapPtr(ptr))) {
@@ -368,10 +376,11 @@ void fast_free(void* ptr) {
         // Large block (release discrimination).
         LargeAllocHeader* header = reinterpret_cast<LargeAllocHeader*>(
             static_cast<char*>(ptr) - sizeof(LargeAllocHeader));
-        std::size_t alloc_size = header->alloc_size;
+        std::size_t const alloc_size = header->alloc_size;
 #if FASTALLOC_DEBUG_ENABLED
+        // DebugOnFreeLarge validates magic, span size and red zone; it does
+        // not modify the header, so alloc_size above is already trustworthy.
         DebugOnFreeLarge(ptr, header);
-        alloc_size = header->alloc_size; // header validated; size trustworthy
         TLSCache::GetFast().CountLargeFree(alloc_size - sizeof(LargeAllocHeader));
 #else
         // Validate large header span size before caching or returning.
@@ -450,7 +459,7 @@ void fast_free(void* ptr) {
 }
 
 void fast_free_sized(void* ptr, std::size_t size) {
-    if (!ptr) return;
+    if (!ptr) { return; }
 
     // Check pointer plausibility before reading block header.
     if (FAST_UNLIKELY(!IsPlausibleHeapPtr(ptr))) {
@@ -483,7 +492,7 @@ void fast_free_sized(void* ptr, std::size_t size) {
 #endif
 
     // Release fast path: the size hint avoids loading the header's class_index.
-    std::size_t class_index = RequestToClass(size);
+    std::size_t const class_index = RequestToClass(size);
     // Verify the caller's size hint against the block header; if mismatched, fallback to standard free.
     if (FAST_UNLIKELY(static_cast<std::size_t>(block->class_index) != class_index)) {
         fast_free(ptr);
@@ -499,8 +508,8 @@ void fast_free_sized(void* ptr, std::size_t size) {
 }
 
 void* fast_calloc(std::size_t num, std::size_t size) {
-    if (num != 0 && size > (static_cast<std::size_t>(-1) / num)) return nullptr;
-    std::size_t total = num * size;
+    if (num != 0 && size > (static_cast<std::size_t>(-1) / num)) { return nullptr; }
+    std::size_t const total = num * size;
     void* ptr = fast_malloc(total);
     if (ptr && total > 0) {
         std::memset(ptr, 0, total);
@@ -549,14 +558,14 @@ void* fast_realloc(void* ptr, std::size_t new_size) {
 
     // ---- Over-aligned blocks ------------------------------------------------
     if (FAST_UNLIKELY(reinterpret_cast<std::uintptr_t>(slab_field) == ALIGN_MAGIC)) {
-        std::size_t alignment = *reinterpret_cast<std::size_t*>(
+        std::size_t const alignment = *reinterpret_cast<std::size_t*>(
             static_cast<char*>(ptr) - 32);
-        std::size_t old_size = *reinterpret_cast<std::size_t*>(
+        std::size_t const old_size = *reinterpret_cast<std::size_t*>(
             static_cast<char*>(ptr) - 8);
         // Validate alignment and size fields recovered from stash.
         if (FAST_UNLIKELY(alignment < ALIGNMENT || alignment > 4096 ||
                           (alignment & (alignment - 1)) != 0 ||
-                          old_size > (1ull << 30))) {
+                          old_size > (1ULL << 30))) {
             ReportCorruptLargeHeader(ptr, old_size);
             errno = EINVAL;
             return nullptr;
@@ -568,20 +577,26 @@ void* fast_realloc(void* ptr, std::size_t new_size) {
             return ptr;
         }
         void* new_ptr = fast_aligned_alloc(alignment, new_size);
-        if (FAST_UNLIKELY(!new_ptr)) return nullptr;
-        std::memcpy(new_ptr, ptr, old_size < new_size ? old_size : new_size);
+        if (FAST_UNLIKELY(!new_ptr)) { return nullptr; }
+        // new_size > old_size is guaranteed by the in-place branch above;
+        // min() keeps the copy robust if that early return ever changes.
+        std::memcpy(new_ptr, ptr, std::min(old_size, new_size));
         fast_free(ptr);
         return new_ptr;
     }
 
-    bool is_large = (slab_field == nullptr);
+    // Deliberately NOT const: in FASTALLOC_DEBUG builds the LARGE_MAGIC
+    // probe below still assigns it, and a const qualification both breaks
+    // that build (read-only assignment) and trips cppcheck's value-flow
+    // folding (knownConditionTrueFalse cascade on every downstream test).
+    bool is_large = (slab_field == nullptr);  // NOLINT(misc-const-correctness)
 #if FASTALLOC_DEBUG_ENABLED
     if (reinterpret_cast<std::uintptr_t>(slab_field) == debug::LARGE_MAGIC) is_large = true;
 #endif
 
     std::size_t old_size = 0;
     if (is_large) {
-        LargeAllocHeader* header = reinterpret_cast<LargeAllocHeader*>(
+        const LargeAllocHeader* header = reinterpret_cast<LargeAllocHeader*>(
             static_cast<char*>(ptr) - sizeof(LargeAllocHeader));
         // Validate header alloc_size before sizing shrink or grow operations.
         if (FAST_UNLIKELY(!LargeHeaderSizePlausible(header->alloc_size))) {
@@ -597,11 +612,11 @@ void* fast_realloc(void* ptr, std::size_t new_size) {
     if (new_size <= old_size) {
         bool should_shrink = false;
         if (FAST_LIKELY(!is_large)) {
-            std::size_t new_class_index = RequestToClass(new_size);
-            if (block->class_index > new_class_index + 1) should_shrink = true;
+            std::size_t const new_class_index = RequestToClass(new_size);
+            if (block->class_index > new_class_index + 1) { should_shrink = true; }
         } else {
-            std::size_t page_size = EffectivePageSize();
-            if (old_size - new_size >= page_size) should_shrink = true;
+            std::size_t const page_size = EffectivePageSize();
+            if (old_size - new_size >= page_size) { should_shrink = true; }
         }
         if (!should_shrink) {
 #if FASTALLOC_DEBUG_ENABLED
@@ -616,13 +631,13 @@ void* fast_realloc(void* ptr, std::size_t new_size) {
                     AllocRegistry::GetInstance().Insert(rec, nullptr);
                 }
                 if (!is_large) {
-                    FreeBlock* blk = reinterpret_cast<FreeBlock*>(
+                    const FreeBlock* blk = reinterpret_cast<FreeBlock*>(
                         static_cast<char*>(ptr) - USER_OFFSET);
                     std::size_t block_size = ClassIndexToSize(blk->class_index);
                     debug_check::FillRearRedZone(static_cast<char*>(ptr) + new_size,
                                                   block_size - USER_OFFSET - new_size);
                 } else {
-                    LargeAllocHeader* h = reinterpret_cast<LargeAllocHeader*>(
+                    const LargeAllocHeader* h = reinterpret_cast<LargeAllocHeader*>(
                         static_cast<char*>(ptr) - sizeof(LargeAllocHeader));
                     std::size_t usable = h->alloc_size - sizeof(LargeAllocHeader);
                     debug_check::FillRearRedZone(static_cast<char*>(ptr) + new_size,
@@ -641,11 +656,13 @@ void* fast_realloc(void* ptr, std::size_t new_size) {
         if (is_large) {
             LargeAllocHeader* header = reinterpret_cast<LargeAllocHeader*>(
                 static_cast<char*>(ptr) - sizeof(LargeAllocHeader));
-            std::size_t needed = PageRoundUp(new_size + sizeof(LargeAllocHeader));
-            [[maybe_unused]] std::size_t span_usable =
-                header->alloc_size - sizeof(LargeAllocHeader);
+            std::size_t const needed = PageRoundUp(new_size + sizeof(LargeAllocHeader));
 #if FASTALLOC_DEBUG_ENABLED
-            // Update debug registry for retained span.
+            // Update debug registry for retained span. span_usable is only
+            // consumed by the registry, so it lives inside the debug branch
+            // (no dead store in release builds).
+            std::size_t span_usable =
+                header->alloc_size - sizeof(LargeAllocHeader);
             auto debug_keep = [&]() {
                 DebugUpdateKeptLargeSpan(ptr, new_size, span_usable);
             };
@@ -657,7 +674,7 @@ void* fast_realloc(void* ptr, std::size_t new_size) {
 #if defined(__linux__) && !defined(FASTALLOC_WINVA_EMULATION)
             if (OSMemory::IsPoolBacked(base)) { debug_keep(); return ptr; } // pooled: keep span
             // mremap shrink: releases the tail pages, never moves the base.
-            std::size_t released = header->alloc_size - needed;
+            std::size_t const released = header->alloc_size - needed;
             void* shrunk = mremap(base, header->alloc_size, needed, 0);
             if (shrunk == MAP_FAILED) { debug_keep(); return ptr; } // keep the old span
             // shrunk == base for non-MAYMOVE calls.
@@ -692,9 +709,13 @@ void* fast_realloc(void* ptr, std::size_t new_size) {
         // Small shrink falls through to the generic copy path.
     } else if (is_large) {
         // ---- Large growth: try to grow in place first -------
+        // Kept non-const: this span is handed to mremap() below, which takes
+        // a plain void* (the kernel may move the mapping); const here would
+        // mean const_cast gymnastics for no analytical gain.
+        // cppcheck-suppress constVariablePointer
         LargeAllocHeader* header = reinterpret_cast<LargeAllocHeader*>(
             static_cast<char*>(ptr) - sizeof(LargeAllocHeader));
-        std::size_t needed = PageRoundUp(new_size + sizeof(LargeAllocHeader));
+        std::size_t const needed = PageRoundUp(new_size + sizeof(LargeAllocHeader));
         if (needed > header->alloc_size) {
 #if defined(__linux__) && !defined(FASTALLOC_WINVA_EMULATION)
             // Pooled spans skip mremap growth: the kernel could grow the
@@ -738,7 +759,7 @@ void* fast_realloc(void* ptr, std::size_t new_size) {
                     rec.size = new_size;
                     AllocRegistry::GetInstance().Insert(rec, nullptr);
                 }
-                LargeAllocHeader* h = reinterpret_cast<LargeAllocHeader*>(
+                const LargeAllocHeader* h = reinterpret_cast<LargeAllocHeader*>(
                     static_cast<char*>(ptr) - sizeof(LargeAllocHeader));
                 std::size_t usable = h->alloc_size - sizeof(LargeAllocHeader);
                 debug_check::FillRearRedZone(static_cast<char*>(ptr) + new_size,
@@ -774,12 +795,14 @@ void* fast_realloc(void* ptr, std::size_t new_size) {
 // Aligned allocation
 // ===========================================================================
 void* fast_aligned_alloc(std::size_t alignment, std::size_t size) {
-    if (size == 0) size = 1; // zero-size policy: unique pointer
+    if (size == 0) { size = 1; // zero-size policy: unique pointer
+}
 
     // Validate: power of two, sane range.
-    if (alignment == 0 || (alignment & (alignment - 1)) != 0) return nullptr;
-    if (alignment < ALIGNMENT) alignment = ALIGNMENT;   // natural minimum
-    if (alignment > 4096) return nullptr;               // supported maximum
+    if (alignment == 0 || (alignment & (alignment - 1)) != 0) { return nullptr; }
+    alignment = std::max(alignment, ALIGNMENT);   // natural minimum
+    if (alignment > 4096) { return nullptr;               // supported maximum
+}
 
     if (alignment <= ALIGNMENT) {
         return fast_malloc(size); // already 16-byte aligned
@@ -787,11 +810,12 @@ void* fast_aligned_alloc(std::size_t alignment, std::size_t size) {
 
     // Over-allocate so the stash (32 bytes) plus alignment slack fits inside
     // the raw block's user region.
-    std::size_t raw_size = size + alignment + 32;
-    if (FAST_UNLIKELY(raw_size < size)) return nullptr; // overflow
+    std::size_t const raw_size = size + alignment + 32;
+    if (FAST_UNLIKELY(raw_size < size)) { return nullptr; // overflow
+}
 
     void* raw = fast_malloc(raw_size);
-    if (FAST_UNLIKELY(!raw)) return nullptr;
+    if (FAST_UNLIKELY(!raw)) { return nullptr; }
 
     char* aligned = reinterpret_cast<char*>(
         (reinterpret_cast<std::uintptr_t>(raw) + 32 + alignment - 1) & ~(alignment - 1));
@@ -839,7 +863,7 @@ void fast_alloc_purge_thread_cache() {
 }
 
 void fast_alloc_audit_pointers(const void* lo, const void* hi) {
-    if (!lo || !hi || lo >= hi) return;
+    if (!lo || !hi || lo >= hi) { return; }
     (void)std::fprintf(stderr,
                  "[fastalloc-audit] scanning allocator head arrays for pointers "
                  "into [%p, %p)\n",
@@ -864,8 +888,8 @@ void fast_alloc_audit_pointers(const void* lo, const void* hi) {
 }
 
 void fast_alloc_log_set_level(int level) {
-    if (level < 0) level = 0;
-    if (level > 5) level = 5;
+    level = std::max(level, 0);
+    level = std::min(level, 5);
     LogSetLevel(static_cast<LogLevel>(level));
 }
 

@@ -72,8 +72,8 @@ public:
     void DeferBinToPending(std::size_t class_index, FreeBlock* head);
 
     // Bypasses slabs for allocations > MAX_SLAB_SIZE, uses global large block cache
-    void* AllocateLarge(std::size_t size);
-    void  DeallocateLarge(void* ptr, std::size_t size);
+    static void* AllocateLarge(std::size_t size);
+    static void  DeallocateLarge(void* ptr, std::size_t size);
 
     // True once process shutdown has begun. Thread-cache destructors check
     // this and skip reflushing memory back into the global heap, avoiding
@@ -117,7 +117,7 @@ private:
         std::array<PendingList, NUM_SIZE_CLASSES> pending_returns_{};
 
         Arena() {
-            for (auto& lock : class_locks_) lock.clear();
+            for (auto& lock : class_locks_) { lock.clear(); }
         }
     };
 
@@ -133,9 +133,9 @@ private:
 
     // Split a single-class free list by each block's own slab arena.
     // heads/tails are caller-provided arrays of NUM_ARENAS entries.
-    void SplitListByArena(FreeBlock* head, FreeBlock** heads, FreeBlock** tails);
+    static void SplitListByArena(FreeBlock* head, FreeBlock** heads, FreeBlock** tails);
 
-    Slab* AllocateNewSlab(std::size_t class_index, uint32_t arena_index);
+    static Slab* AllocateNewSlab(std::size_t class_index, uint32_t arena_index);
 
     // Helper to extract blocks and advance slab pointers
     FreeBlock* ExtractBlocksFromSlab(Slab* slab, std::size_t class_index, std::size_t target_count, std::size_t& actual_count, uint32_t arena_index);
