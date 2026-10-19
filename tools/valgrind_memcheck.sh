@@ -49,8 +49,12 @@ run_one() {  # <binary> <label>
         echo "--- $label: CLEAN ($(grep -c '^==.*==\s' "valgrind_$label.log" || true) valgrind log lines)"
     elif [ "$rc" -eq 42 ]; then
         echo "!! $label: MEMCHECK ERRORS" >&2
-        grep -E "ERROR SUMMARY|Invalid|uninitialised|definitely lost" \
-            "valgrind_$label.log" | head -20 >&2
+        # -m 20 (not `grep | head -20`): with hundreds of findings the pipe
+        # form SIGPIPEs grep once head exits, and under pipefail that aborts
+        # this script with 141 before `return 1` can run. grep -m stops
+        # reading on its own once it has printed 20 matches.
+        grep -m 20 -E "ERROR SUMMARY|Invalid|uninitialised|definitely lost" \
+            "valgrind_$label.log" >&2
         return 1
     else
         echo "!! $label: test binary failed rc=$rc (full log streamed above; also in valgrind_$label.log)" >&2

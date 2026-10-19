@@ -120,11 +120,20 @@ else
     cg_annotate --no-annotate --show-percs --threshold=1 "$OUT" > "$ANN"
 fi
 echo "--- hottest file:function pairs (>=1% of sort event; LL misses first) ---"
-sed -n '/File:function summary/,$p' "$ANN" | head -16
+# File-mediated on purpose (not `sed | head`): the annotation file can be
+# far larger than the head window, and under `set -o pipefail` the SIGPIPE
+# that head delivers to sed when it closes early would abort the whole
+# script with 141 even though everything succeeded.
+sed -n '/File:function summary/,$p' "$ANN" > "$ANN.fns"
+head -16 "$ANN.fns"
 
 echo "--- hottest annotated source lines ---"
 # --auto is accepted across generations (newer cg_annotate deprecates it in
 # favour of --annotate but still honours it).
 cg_annotate --auto=yes --threshold=1 "$OUT" > "$ANN" || true
-sed -n '/^-- Annotated source/,$p' "$ANN" | head -40
+# Same SIGPIPE hazard as above: sed would be killed by head's early close
+# once the annotated source exceeds the head window, which a real profile
+# reliably does - so land the section in a file and head that file.
+sed -n '/^-- Annotated source/,$p' "$ANN" > "$ANN.lines"
+head -40 "$ANN.lines"
 echo "profile: $OUT  (raw valgrind log: $BUILD/cachegrind.vg.log)"
